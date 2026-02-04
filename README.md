@@ -1,18 +1,18 @@
-# AutoPTT
+# AutoPtT
 
-Enumerate Kerberos sessions and tickets and perform Pass-The-Ticket (PtT) attacks interactively. It allows to:
+Enumerate Kerberos sessions and tickets and perform Pass-The-Ticket (PtT) attacks interactively.
 
-- List logon sessions on the system like klist.
+- List logon sessions on the system like `klist`.
 
-- View tickets from current session like klist.
+- View tickets from current session like `klist`.
 
-- View tickets from all sessions like Rubeus.
+- View tickets from all sessions like `Rubeus`.
 
-- Extract TGT tickets like Rubeus or Mimikatz.
+- Extract TGT tickets like `Rubeus` or `Mimikatz`.
 
-- Import tickets into current session like Rubeus or Mimikatz.
+- Import tickets into current session like `Rubeus` or `Mimikatz`.
 
-You can do this step by step or automatically using the "auto" option.
+You can do this step by step or automatically using the **"auto"** option.
 
 <br>
 
@@ -20,25 +20,17 @@ You can do this step by step or automatically using the "auto" option.
 
 ## Usage
 
-```bash
-# View all logon sessions
-autoptt.exe sessions
+- **`autoptt.exe sessions`** - View all logon sessions
 
-# List tickets in current session
-autoptt.exe klist
+- **`autoptt.exe klist`** - List tickets in current session
 
-# Enumerate ALL tickets from ALL sessions (requires admin)
-autoptt.exe tickets
+- **`autoptt.exe tickets`** - Enumerate ALL tickets from ALL sessions (requires admin)
 
-# Export a TGT by LogonId
-autoptt.exe export 0x79fb3
+- **`autoptt.exe export <LOGON_ID>`** - Export a TGT by LogonId
 
-# Import a ticket file
-autoptt.exe ptt 0x79fb3_Administrator.kirbi
+- **`autoptt.exe ptt <TICKET_FILE>`** - Import a ticket file (.kirbi)
 
-# Interactive mode: Browse and import tickets
-autoptt.exe auto
-```
+- **`autoptt.exe auto`** - Interactive mode: Browse and import tickets
 
 <br>
 
@@ -48,7 +40,7 @@ autoptt.exe auto
 
 List all logon sessions:
 
-```bash
+```
 autoptt.exe sessions
 ```
 
@@ -57,7 +49,7 @@ autoptt.exe sessions
 
 Show tickets in current session:
 
-```bash
+```
 autoptt.exe klist
 ```
 
@@ -66,17 +58,17 @@ autoptt.exe klist
 
 Enumerate all tickets:
 
-```bash
+```
 autoptt.exe tickets
 ```
 
 ![img3](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_3.png)
 
 
-Export TGT to .kirbi file given LogonId (e.g., 0x79fb3):
+Export TGT to .kirbi file given LogonId (in this case, 0x79fb3):
 
 ```
-autoptt.exe export <LOGON_ID>
+autoptt.exe export 0x79fb3
 ```
 
 ![img4](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_4.png)
@@ -84,8 +76,8 @@ autoptt.exe export <LOGON_ID>
 
 Import .kirbi ticket file:
 
-```bash
-autoptt.exe ptt <PTT_FILE>
+```
+autoptt.exe ptt 0x79fb3_Administrator.kirbi
 ```
 
 ![img5](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_5.png)
@@ -93,7 +85,7 @@ autoptt.exe ptt <PTT_FILE>
 
 Interactive mode: browse and import TGTs:
 
-```bash
+```
 autoptt.exe auto
 ```
 
