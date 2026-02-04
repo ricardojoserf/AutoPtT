@@ -1,21 +1,21 @@
 # AutoPtT
 
-Enumerate Kerberos tickets and perform Pass-The-Ticket (PtT) attacks interactively.
+Enumerate Kerberos tickets and perform Pass-the-Ticket (PtT) attacks interactively.
 
 
-You can do this step by step or automatically with the different options:
+You can do this step by step or automatically using the following options:
 
 - **`auto`** - Automated Pass-the-Ticket attack
 
-- **`sessions`** - View all logon sessions. Similar to running `klist sessions`
+- **`sessions`** - List logon sessions. Similar to running `klist sessions`
 
-- **`klist`** - List tickets in current session. Similar to running `klist`
+- **`klist`** - List tickets in the current session. Similar to running `klist`
 
-- **`tickets`** - Enumerate tickets from all sessions. Similar to running `Rubeus.exe dump`
+- **`tickets`** - List tickets in all sessions (not only TGTs). Similar to running `Rubeus.exe dump`
 
 - **`export`** - Export a TGT given the LogonId. Similar to running `Rubeus.exe dump`
 
-- **`ptt`** - Import a ticket file (.kirbi) given the file name. Similar to running `Rubeus.exe ptt`
+- **`ptt`** - Import a ticket file given the file name. Similar to running `Rubeus.exe ptt`
 
 <br>
 
@@ -23,9 +23,9 @@ You can do this step by step or automatically with the different options:
 
 ## Examples
 
-#### Automated Pass-The-Ticket
+#### Automated Pass-the-Ticket
 
-The tool enumerates the available TGTs, choose the index and the ticket gets dumped and imported to your session:
+The tool enumerates the available TGTs. Choose an index and the ticket will be dumped and imported into your session:
 
 ```
 autoptt.exe auto
@@ -43,7 +43,7 @@ autoptt.exe sessions
 ![img1](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_1.png)
 
 
-#### List tickets in current session
+#### List tickets in the current session
 
 ```
 autoptt.exe klist
@@ -61,7 +61,7 @@ autoptt.exe tickets
 ![img3](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_3.png)
 
 
-#### Export TGT given LogonId (in this case, 0x79fb3)
+#### Export TGT given the LogonId (in this case, 0x79fb3)
 
 ```
 autoptt.exe export 0x79fb3
@@ -70,7 +70,7 @@ autoptt.exe export 0x79fb3
 ![img4](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_4.png)
 
 
-#### Import ticket file
+#### Import ticket file given the file name
 
 ```
 autoptt.exe ptt 0x79fb3_Administrator.kirbi
