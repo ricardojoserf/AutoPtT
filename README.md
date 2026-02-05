@@ -25,7 +25,7 @@ You can do this step by step or automatically using the following options:
 
 #### Automated Pass-the-Ticket
 
-The tool enumerates the available TGTs. Choose an index and the ticket will be dumped and imported into your session:
+Choose the index for one of the available TGTs, it gets dumped and imported into your session:
 
 ```
 autoptt.exe auto
