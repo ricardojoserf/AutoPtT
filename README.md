@@ -73,7 +73,7 @@ autoptt.exe export 0x5f7d0
 #### Import ticket file given the file name
 
 ```
-autoptt.exe ptt 0x79fb3_Administrator.kirbi
+autoptt.exe ptt 0x5f7d0_Administrator.kirbi
 ```
 
 ![img5](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_5.png)
