@@ -61,10 +61,10 @@ autoptt.exe tickets
 ![img3](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_3.png)
 
 
-#### Export TGT given the LogonId (in this case, 0x79fb3)
+#### Export TGT given the LogonId (in this case, 0x5f7d0)
 
 ```
-autoptt.exe export 0x79fb3
+autoptt.exe export 0x5f7d0
 ```
 
 ![img4](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_4.png)
