@@ -1929,20 +1929,12 @@ int main(int argc, char* argv[]) {
         PrintBanner();
         printf("Kerberos Sessions and Tickets Enumerator\n\n");
         printf("Usage:\n");
-        printf("  %s sessions         - Enumerate logon sessions (like 'klist sessions')\n", argv[0]);
-        printf("  %s klist            - Enumerate MY tickets (current session)\n", argv[0]);
-        printf("  %s tickets          - Enumerate ALL tickets from ALL sessions\n", argv[0]);
-        printf("  %s export <LogonId> - Export TGT by LogonId (hex format)\n", argv[0]);
-        printf("  %s ptt <file>       - Import .kirbi ticket\n\n", argv[0]);
-        printf("  %s auto             - Interactive: list TGTs and import selected one\n", argv[0]);
-
-        printf("Examples:\n");
-        printf("  %s sessions\n", argv[0]);
-        printf("  %s klist\n", argv[0]);
-        printf("  %s tickets          # View tickets from ALL sessions with Base64\n", argv[0]);
-        printf("  %s export 0x79fb3   # Export TGT for LogonId 0x79fb3\n", argv[0]);
-        printf("  %s ptt 0x79fb3_Administrator.kirbi\n", argv[0]);
-        printf("  %s auto             # Interactive mode to import a TGT\n", argv[0]);
+        printf("  %s auto             - Automated Pass-the-Ticket attack\n", argv[0]);
+        printf("  %s sessions         - List logon sessions\n", argv[0]);
+        printf("  %s klist            - List tickets in the current session\n", argv[0]);
+        printf("  %s tickets          - List tickets in all sessions (not only TGTs)\n", argv[0]);
+        printf("  %s export <LogonId> - Export a TGT given the LogonId\n", argv[0]);
+        printf("  %s ptt <file>       - Import a ticket file given the file name\n", argv[0]);
     }
 
     return 0;
