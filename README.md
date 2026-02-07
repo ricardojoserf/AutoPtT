@@ -17,6 +17,7 @@ You can do this step by step or automatically using the following options:
 
 - **`ptt`** - Import a ticket file given the file name. Similar to running `Rubeus.exe ptt`
 
+
 <br>
 
 -----------------------------------------------
@@ -69,7 +70,6 @@ autoptt.exe export 0x5f7d0
 
 ![img4](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_4.png)
 
-
 #### Import ticket file given the file name
 
 ```
@@ -77,3 +77,22 @@ autoptt.exe ptt 0x5f7d0_Administrator.kirbi
 ```
 
 ![img5](https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/autoptt/Screenshot_5.png)
+
+
+<br>
+
+-----------------------------------------------
+
+## Acknowledgments
+
+Heavily inspired by and adapted from:
+
+- [Mimikatz](https://github.com/gentilkiwi/mimikatz) by **Benjamin Delpy** ([@gentilkiwi](https://github.com/gentilkiwi))
+
+- [Rubeus](https://github.com/GhostPack/Rubeus) by **Will Schroeder** ([@harmj0y](https://github.com/harmj0y)) and **Lee Christensen** ([@leechristensen](https://github.com/leechristensen))
+
+- klist utility by **Microsoft**
+
+* [Claude](https://claude.ai) AI assistant by **Anthropic**
+
+<br>
