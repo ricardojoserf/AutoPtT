@@ -1,6 +1,6 @@
 # AutoPtT
 
-Enumerate Kerberos tickets and perform Pass-the-Ticket (PtT) attacks interactively.
+Enumerate Kerberos tickets and perform Pass-the-Ticket (PtT) attacks interactively in C++ or Python.
 
 
 You can do this step by step or automatically using the following options:
@@ -92,7 +92,5 @@ Heavily inspired by and adapted from:
 - [Rubeus](https://github.com/GhostPack/Rubeus) by **Will Schroeder** ([@harmj0y](https://github.com/harmj0y)) and **Lee Christensen** ([@leechristensen](https://github.com/leechristensen))
 
 - klist utility by **Microsoft**
-
-* [Claude](https://claude.ai) AI assistant by **Anthropic**
 
 <br>
