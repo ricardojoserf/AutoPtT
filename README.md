@@ -1,9 +1,9 @@
 # AutoPtT
 
-Enumerate Kerberos tickets and perform Pass-the-Ticket (PtT) attacks interactively in C++ or Python.
+AutoPtT enumerates Kerberos tickets and performs Pass-the-Ticket (PtT) attacks interactively or step by step. It is a standalone alternative to Rubeus or Mimikatz, implemented in C++ and Python.
 
 
-You can do this step by step or automatically using the following options:
+You can use the following options:
 
 - **`auto`** - Automated Pass-the-Ticket attack
 
