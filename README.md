@@ -1,6 +1,6 @@
 # AutoPtT
 
-AutoPtT enumerates Kerberos tickets and performs Pass-the-Ticket (PtT) attacks interactively or step by step. It is a standalone alternative to Rubeus or Mimikatz for this attack, implemented in C#, C++, Python and Rust.
+AutoPtT enumerates Kerberos tickets and performs Pass-the-Ticket (PtT) attacks interactively or step by step. It is a standalone alternative to Rubeus or Mimikatz for this attack, implemented in C#, C++, Crystal, Python and Rust.
 
 
 You can use the following options:
